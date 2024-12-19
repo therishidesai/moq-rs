@@ -36,6 +36,7 @@ in
       '';
     };
     tls = {
+      enable = lib.mkEnableOption "tls";
       keyPath = lib.mkOption {
         type = lib.types.path;
         example = "/var/lib/acme/moq-relay.example.org/key.pem";
@@ -61,7 +62,7 @@ in
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
-        ExecStart = "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-cert ${cfg.tls.certPath} --tls-key ${cfg.tls.keyPath}";
+        ExecStart = if cfg.tls.enable then "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-cert ${cfg.tls.certPath} --tls-key ${cfg.tls.keyPath}" else "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-disable-verify --tls-cert ${cfg.tls.certPath} --tls-key ${cfg.tls.keyPath}";
         Restart = "on-failure";
         RestartSec = "1";
 

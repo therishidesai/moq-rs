@@ -107,7 +107,7 @@ impl WatchBackend {
 	}
 
 	async fn run(&mut self) -> Result<()> {
-		let session = super::session::connect(&self.src).await?;
+		let session = super::session::connect(&mut self.src).await?;
 		let path = self.src.path_segments().ok_or(Error::InvalidUrl)?.collect();
 		let mut broadcast = moq_karp::BroadcastConsumer::new(session, path);
 

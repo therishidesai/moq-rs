@@ -10,6 +10,12 @@ in
 {
   options.services.moq-relay = {
     enable = lib.mkEnableOption "moq-relay";
+    dev = lib.mkEnableOption "dev";
+    dev_url = lib.mkOption {
+      description = "url for the self signed cert (e.g: localhost)";
+      type = lib.types.str;
+      default = "localhost";
+    };
     port = lib.mkOption {
       type = lib.types.port;
       default = 443;
@@ -61,7 +67,10 @@ in
       serviceConfig = {
         User = cfg.user;
         Group = cfg.group;
-        ExecStart = "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-cert ${cfg.tls.certPath} --tls-key ${cfg.tls.keyPath}";
+        ExecStart = if cfg.dev then
+          "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-self-sign ${cfg.dev_url}:${builtins.toString cfg.port} --tls-disable-verify --dev"
+          else 
+          "${pkgs.moq.moq-relay}/bin/moq-relay --bind [::]:${builtins.toString cfg.port} --tls-cert ${cfg.tls.certPath} --tls-key ${cfg.tls.keyPath}";
         Restart = "on-failure";
         RestartSec = "1";
 

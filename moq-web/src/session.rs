@@ -59,7 +59,7 @@ impl Connect {
 		let client = web_transport::Client::new().congestion_control(web_transport::CongestionControl::LowLatency);
 
 		let session = match addr.scheme() {
-			"http" => {
+			"http" | "https" => {
 				// TODO Unfortunately, WebTransport doesn't work correctly with self-signed certificates.
 				// Until that gets fixed, we need to perform a HTTP request to fetch the certificate hashes.
 				let fingerprint = Self::fingerprint(addr).await?;
@@ -70,7 +70,7 @@ impl Connect {
 				let _ = addr.set_scheme("https");
 				client.connect(&addr).await?
 			}
-			"https" => client.connect(addr).await?,
+			// "https" => client.connect(addr).await?,
 			_ => return Err(Error::InvalidUrl),
 		};
 

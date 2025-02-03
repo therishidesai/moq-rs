@@ -1,5 +1,5 @@
 {
-	"name": "@kixelated/moq",
+	"name": "@rmallick6806/moq-ts-fingerprint",
 	"version": "0.0.1",
 	"type": "module",
 	"module": "./dist/src/index.js",
@@ -22,12 +22,20 @@
 			"import": "./dist/src/element/watch.js"
 		}
 	},
-	"sideEffects": ["./dist/src/element/video.js", "./dist/src/element/publish.js", "./dist/src/element/watch.js"],
-	"files": ["dist", "pkg", "README.md", "LICENSE*"],
+	"sideEffects": [
+		"./dist/src/element/video.js",
+		"./dist/src/element/publish.js",
+		"./dist/src/element/watch.js"
+	],
+	"files": [
+		"dist",
+		"pkg",
+		"README.md",
+		"LICENSE*"
+	],
 	"scripts": {
 		"all": "npm-run-all --print-label --parallel --race relay pub web",
 		"cluster": "npm-run-all --print-label --parallel --race relay relay-leaf pub-leaf web",
-
 		"relay": "./dev/relay",
 		"relay-leaf": "PORT=4444 ./dev/relay --cluster-root localhost:4443",
 		"pub": "./dev/pub",
@@ -35,11 +43,9 @@
 		"gst": "./dev/gst",
 		"clock": "./dev/clock",
 		"web": "rspack serve",
-
 		"check": "biome check && cargo check --all",
 		"fix": "biome check --write && cargo clippy --all --fix --allow-dirty --allow-staged && cargo fmt --all",
 		"fmt": "biome format --write && cargo fmt --all",
-		"postinstall": "npm run build",
 		"build": "wasm-pack build --out-dir ../pkg moq-web --release --scope kixelated --out-name index && rm pkg/.gitignore && tsc"
 	},
 	"dependencies": {

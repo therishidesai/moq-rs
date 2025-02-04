@@ -7,7 +7,6 @@ use wasm_bindgen_futures::spawn_local;
 
 use serde::{Deserialize, Serialize};
 
-
 use crate::{Error, Result};
 
 // Can't use LazyLock in WASM because nothing is Sync
@@ -15,10 +14,10 @@ thread_local! {
 	static CACHE: RefCell<HashMap<Url, Connect>> = RefCell::new(HashMap::new());
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FingerprintResponse {
-    fingerprint: String,
-    transport_url: Url,
+	fingerprint: String,
+	transport_url: Url,
 }
 
 #[derive(Clone)]
@@ -79,22 +78,25 @@ impl Connect {
 				let _ = addr.set_scheme("https");
 				client.connect(&addr).await?
 			}
-		    "https" => {
-                        // NOTE: we will still send a fingerprint
-                        // request on https but we will get a
-                        // different response that gives you a json of
-                        // the ssl cert and the actual underlying URL.
-                        let mut fingerprint = addr.clone();
-		        fingerprint.set_path("fingerprint");
+			"https" => {
+				// NOTE: we will still send a fingerprint
+				// request on https but we will get a
+				// different response that gives you a json of
+				// the ssl cert and the actual underlying URL.
+				let mut fingerprint = addr.clone();
+				fingerprint.set_path("fingerprint");
+				tracing::error!("{fingerprint}");
 
-		        let resp = gloo_net::http::Request::get(fingerprint.as_str()).send().await?;
+				let resp = gloo_net::http::Request::get(fingerprint.as_str()).send().await?;
+				tracing::error!("{:?}", resp);
 
-                        let fp_res = resp.json::<FingerprintResponse>().await?;
+				let fp_res = resp.json::<FingerprintResponse>().await?;
+				tracing::error!("{:?}", fp_res);
 
-			let client = client.server_certificate_hashes(vec![fp_res.fingerprint.into()]);
+				let client = client.server_certificate_hashes(vec![fp_res.fingerprint.into()]);
 
-                        client.connect(&fp_res.transport_url).await?
-                    },
+				client.connect(&fp_res.transport_url).await?
+			}
 			_ => return Err(Error::InvalidUrl),
 		};
 

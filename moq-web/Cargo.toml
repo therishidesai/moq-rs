@@ -17,7 +17,7 @@ wasm-bindgen-futures = "0.4"
 console_error_panic_hook = "0.1"
 tracing = "0.1"
 wasm-tracing = "0.2"
-gloo-net = "0.6"
+gloo-net = { version = "0.6", features = ["json"] }
 
 moq-karp = { version = "0.12", path = "../moq-karp", default-features = false }
 moq-async = { version = "0.1", path = "../moq-async" }
@@ -26,10 +26,12 @@ web-codecs = "0.3.3"
 tokio = { version = "1", features = ["sync"] }
 
 js-sys = "0.3.77"
-url = "2"
+url = { version = "2", features = ["serde"] }
 thiserror = "2"
 hex = "0.4"
 baton = "0.2"
+serde = { version = "1.0.217", features = ["derive"] }
+serde_json = "1.0.138"
 
 [dependencies.web-sys]
 version = "0.3.77"

@@ -91,9 +91,11 @@ impl Connect {
 				tracing::error!("{:?}", resp);
 
 				let fp_res = resp.json::<FingerprintResponse>().await?;
-				tracing::error!("{:?}", fp_res);
+				tracing::info!("{:?}", fp_res);
 
-				let client = client.server_certificate_hashes(vec![fp_res.fingerprint.into()]);
+				let fingerprint = hex::decode(fp_res.fingerprint.trim()).map_err(|_| Error::InvalidFingerprint)?;
+
+				let client = client.server_certificate_hashes(vec![fingerprint]);
 
 				client.connect(&fp_res.transport_url).await?
 			}

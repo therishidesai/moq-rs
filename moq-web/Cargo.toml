@@ -27,10 +27,11 @@ web-time = "1"
 tokio = { version = "1", features = ["sync"] }
 
 js-sys = "0.3.77"
-url = "2"
+url = { version = "2", features = ["serde"] }
 thiserror = "2"
 hex = "0.4"
 baton = "0.2.1"
+serde = { version = "1.0.217", features = ["derive"] }
 
 [dependencies.web-sys]
 version = "0.3.77"

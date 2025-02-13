@@ -7,7 +7,15 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{Error, Result};
 
+use serde::{Deserialize, Serialize};
+
 type ConnectionPending = watch::Receiver<Option<Result<moq_transfork::Session>>>;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct FingerprintResponse {
+	fingerprint: String,
+	transport_url: Url,
+}
 
 // Can't use LazyLock in WASM because nothing is Sync
 thread_local! {
@@ -83,9 +91,26 @@ impl Connect {
 				let _ = addr.set_scheme("https");
 				client.connect(&addr).await?
 			}
-			"https" => {
-				let client = client.with_system_roots()?;
-				client.connect(addr).await?
+		    "https" => {
+                        // NOTE: we will still send a fingerprint
+				// request on https but we will get a
+				// different response that gives you a json of
+				// the ssl cert and the actual underlying URL.
+				let mut fingerprint = addr.clone();
+				fingerprint.set_path("fingerprint");
+				tracing::error!("{fingerprint}");
+
+				let resp = gloo_net::http::Request::get(fingerprint.as_str()).send().await?;
+				tracing::error!("{:?}", resp);
+
+				let fp_res = resp.json::<FingerprintResponse>().await?;
+				tracing::info!("{:?}", fp_res);
+
+				let fingerprint = hex::decode(fp_res.fingerprint.trim()).map_err(|_| Error::InvalidFingerprint)?;
+
+				let client = client.with_server_certificate_hashes(vec![fingerprint])?;
+
+				client.connect(&fp_res.transport_url).await?
 			}
 			_ => return Err(Error::InvalidUrl(addr.to_string())),
 		};

@@ -79,6 +79,7 @@ impl Connect {
 		let client =
 			web_transport::ClientBuilder::new().with_congestion_control(web_transport::CongestionControl::LowLatency);
 
+            tracing::error!("About to enter the match with addr: {}", addr);
 		let session = match addr.scheme() {
 			"http" => {
 				// TODO Unfortunately, WebTransport doesn't work correctly with self-signed certificates.

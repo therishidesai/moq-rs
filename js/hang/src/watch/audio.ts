@@ -1,3 +1,4 @@
+import { Buffer } from "buffer";
 import * as Moq from "@kixelated/moq";
 import { Memo, Signal, Signals, cleanup, signal } from "@kixelated/signals";
 import * as Catalog from "../catalog";

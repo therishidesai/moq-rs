@@ -1,5 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -90,7 +91,7 @@ impl Auth {
 
 	// Parse/validate a user provided URL.
 	pub fn validate(&self, url: &Url) -> anyhow::Result<moq_token::Payload> {
-		tracing::trace!(path = url.path(), "validating URL");
+		tracing::debug!(path = url.path(), "validating URL");
 
 		let path = url.path().trim_start_matches('/');
 		let (prefix, suffix) = path.rsplit_once("/").unwrap_or(("", path));
@@ -98,7 +99,9 @@ impl Auth {
 		let auth = self.paths.get(prefix).unwrap_or(&self.key);
 
 		if let Some(token) = suffix.strip_suffix(".jwt") {
-			let auth = auth.as_ref().expect("no authentication configured");
+			let auth = auth
+				.as_ref()
+				.context(format!("no authentication configured for prefix: {}", prefix))?;
 
 			// Verify the token and return the payload.
 			let mut token = auth.verify(token)?;

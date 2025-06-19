@@ -1,3 +1,4 @@
+import solid from "@kixelated/signals/solid";
 import { Match, Switch, createSelector } from "solid-js";
 import { JSX } from "solid-js/jsx-runtime";
 import { Broadcast, Device } from "./broadcast";
@@ -20,10 +21,10 @@ export function Controls(props: { broadcast: Broadcast }): JSX.Element {
 }
 
 function Status(props: { broadcast: Broadcast }): JSX.Element {
-	const url = props.broadcast.connection.url.get;
-	const status = props.broadcast.connection.status.get;
-	const audio = props.broadcast.audio.catalog.get;
-	const video = props.broadcast.video.catalog.get;
+	const url = solid(props.broadcast.connection.url);
+	const status = solid(props.broadcast.connection.status);
+	const audio = solid(props.broadcast.audio.catalog);
+	const video = solid(props.broadcast.video.catalog);
 
 	return (
 		<div>
@@ -46,7 +47,7 @@ function Select(props: { broadcast: Broadcast }): JSX.Element {
 		props.broadcast.device.set(device);
 	};
 
-	const selected = createSelector(props.broadcast.device.get);
+	const selected = createSelector(solid(props.broadcast.device));
 
 	const buttonStyle = (id: Device | undefined) => ({
 		cursor: "pointer",

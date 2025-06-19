@@ -1,95 +1,11 @@
 import { Buffer } from "buffer";
 import * as Moq from "@kixelated/moq";
-import { Memo, Signal, Signals, cleanup, signal } from "@kixelated/signals";
+import { Computed, Effect, Root, Signal } from "@kixelated/signals";
 import * as Catalog from "../catalog";
 import * as Container from "../container";
 
 // An annoying hack, but there's stuttering that we need to fix.
 const LATENCY = 50;
-
-// Expose the root of the audio graph so we can use it for custom visualizations.
-export type AudioRoot = {
-	context: AudioContext;
-	node: GainNode;
-};
-
-export type AudioEmitterProps = {
-	volume?: number;
-	muted?: boolean;
-	paused?: boolean;
-};
-
-// A helper that emits audio directly to the speakers.
-export class AudioEmitter {
-	source: Audio;
-	volume: Signal<number>;
-	muted: Signal<boolean>;
-
-	// Similar to muted, but controls whether we download audio at all.
-	// That way we can be "muted" but also download audio for visualizations.
-	paused: Signal<boolean>;
-
-	#signals = new Signals();
-
-	// The volume to use when unmuted.
-	#unmuteVolume = 0.5;
-
-	// The gain node used to adjust the volume.
-	#gain = signal<GainNode | undefined>(undefined);
-
-	constructor(source: Audio, props?: AudioEmitterProps) {
-		this.source = source;
-		this.volume = signal(props?.volume ?? 0.5);
-		this.muted = signal(props?.muted ?? false);
-		this.paused = signal(props?.paused ?? props?.muted ?? false);
-
-		// Set the volume to 0 when muted.
-		this.#signals.effect(() => {
-			const muted = this.muted.get();
-			if (muted) {
-				this.#unmuteVolume = this.volume.peek() || 0.5;
-				this.volume.set(0);
-				this.source.enabled.set(false);
-			} else {
-				this.volume.set(this.#unmuteVolume);
-				this.source.enabled.set(true);
-			}
-		});
-
-		// Set unmute when the volume is non-zero.
-		this.#signals.effect(() => {
-			const volume = this.volume.get();
-			this.muted.set(volume === 0);
-		});
-
-		this.#signals.effect(() => {
-			const root = this.source.root.get();
-			if (!root) return;
-
-			const gain = new GainNode(root.context, { gain: this.volume.peek() });
-			root.node.connect(gain);
-			gain.connect(root.context.destination); // speakers
-
-			this.#gain.set(gain);
-		});
-
-		this.#signals.effect(() => {
-			const gain = this.#gain.get();
-			if (!gain) return;
-
-			const volume = this.volume.get();
-			gain.gain.value = volume;
-		});
-
-		this.#signals.effect(() => {
-			this.source.enabled.set(!this.paused.get());
-		});
-	}
-
-	close() {
-		this.#signals.close();
-	}
-}
 
 export type AudioProps = {
 	enabled?: boolean;
@@ -101,14 +17,14 @@ export class Audio {
 	broadcast: Signal<Moq.BroadcastConsumer | undefined>;
 	catalog: Signal<Catalog.Root | undefined>;
 	enabled: Signal<boolean>;
-	selected: Memo<Catalog.Audio | undefined>;
+	selected: Computed<Catalog.Audio | undefined>;
 
-	// The raw audio context, which can be used for custom visualizations.
-	// If using this class directly, you'll need to hook up audio to speakers, an analyzer, etc.
-	#root = signal<AudioRoot | undefined>(undefined);
+	// The root of the audio graph, which can be used for custom visualizations.
+	// You can access the audio context via `root.context`.
+	#root = new Signal<AudioNode | undefined>(undefined);
 	readonly root = this.#root.readonly();
 
-	#sampleRate = signal<number | undefined>(undefined);
+	#sampleRate = new Signal<number | undefined>(undefined);
 	readonly sampleRate = this.#sampleRate.readonly();
 
 	// Reusable audio buffers.
@@ -118,7 +34,7 @@ export class Audio {
 	// Used to convert from timestamp units to AudioContext units.
 	#ref?: number;
 
-	#signals = new Signals();
+	#signals = new Root();
 
 	constructor(
 		broadcast: Signal<Moq.BroadcastConsumer | undefined>,
@@ -127,13 +43,13 @@ export class Audio {
 	) {
 		this.broadcast = broadcast;
 		this.catalog = catalog;
-		this.enabled = signal(props?.enabled ?? false);
+		this.enabled = new Signal(props?.enabled ?? false);
 
-		this.selected = this.#signals.memo(() => this.catalog.get()?.audio?.[0], { deepEquals: true });
+		this.selected = this.#signals.computed((effect) => effect.get(this.catalog)?.audio?.[0]);
 
 		// Stop all active samples when disabled.
-		this.#signals.effect(() => {
-			const enabled = this.enabled.get();
+		this.#signals.effect((effect) => {
+			const enabled = effect.get(this.enabled);
 			if (enabled) return;
 
 			for (const active of this.#active) {
@@ -141,54 +57,53 @@ export class Audio {
 			}
 		});
 
-		this.#signals.effect(() => {
-			const enabled = this.enabled.get();
+		this.#signals.effect((effect) => {
+			const enabled = effect.get(this.enabled);
 			if (!enabled) return undefined;
 
-			const sampleRate = this.#sampleRate.get();
+			const sampleRate = effect.get(this.#sampleRate);
 			if (!sampleRate) return undefined;
 
 			// NOTE: We still create an AudioContext even when muted.
 			// This way we can process the audio for visualizations.
 
-			const root = new AudioContext({ latencyHint: "interactive", sampleRate });
-			if (root.state === "suspended") {
+			const context = new AudioContext({ latencyHint: "interactive", sampleRate });
+			if (context.state === "suspended") {
 				// Force disabled if autoplay restrictions are preventing us from playing.
 				this.enabled.set(false);
 				return;
 			}
 
-			// Make a dummy gain node that we can expose.
-			const node = new GainNode(root, { gain: 1 });
-			this.#root.set({ context: root, node });
+			effect.cleanup(() => context.close());
 
-			return () => {
-				node.disconnect();
-				root.close();
-				this.#root.set(undefined);
-			};
+			// Make a dummy gain node that we can expose.
+			const node = new GainNode(context, { gain: 1 });
+			effect.cleanup(() => node.disconnect());
+
+			this.#root.set(node);
+			effect.cleanup(() => this.#root.set(undefined));
 		});
 
-		this.#signals.effect(() => this.#init());
+		this.#signals.effect(this.#init.bind(this));
 	}
 
-	#init() {
-		if (!this.enabled.get()) return;
+	#init(effect: Effect): void {
+		if (!effect.get(this.enabled)) return;
 
-		const selected = this.selected.get();
+		const selected = effect.get(this.selected);
 		if (!selected) return;
 
-		const broadcast = this.broadcast.get();
+		const broadcast = effect.get(this.broadcast);
 		if (!broadcast) return;
 
 		const sub = broadcast.subscribe(selected.track.name, selected.track.priority);
-		cleanup(() => sub.close());
+		effect.cleanup(() => sub.close());
 
 		const decoder = new AudioDecoder({
 			output: (data) => this.#emit(data),
 			error: (error) => console.error(error),
 		});
-		cleanup(() => decoder.close());
+		effect.cleanup(() => decoder.close());
 
 		const config = selected.config;
 
@@ -197,9 +112,9 @@ export class Audio {
 			description: config.description ? Buffer.from(config.description, "hex") : undefined,
 		});
 
-		(async () => {
+		effect.spawn(async (cancel) => {
 			for (;;) {
-				const frame = await sub.nextFrame();
+				const frame = await Promise.race([sub.nextFrame(), cancel]);
 				if (!frame) break;
 
 				const decoded = Container.decodeFrame(frame.data);
@@ -212,13 +127,13 @@ export class Audio {
 
 				decoder.decode(chunk);
 			}
-		})();
+		});
 	}
 
 	#emit(sample: AudioData) {
 		this.#sampleRate.set(sample.sampleRate);
 
-		const root = this.#root.get();
+		const root = this.#root.peek();
 		if (!root) {
 			sample.close();
 			return;
@@ -261,7 +176,7 @@ export class Audio {
 		this.#scheduleBuffer(root, buffer, timestamp, when);
 	}
 
-	#createBuffer(sample: AudioData, context: AudioContext): AudioBuffer {
+	#createBuffer(sample: AudioData, context: BaseAudioContext): AudioBuffer {
 		let buffer: AudioBuffer | undefined;
 
 		while (this.#buffers.length > 0) {
@@ -292,10 +207,10 @@ export class Audio {
 		return buffer;
 	}
 
-	#scheduleBuffer(root: AudioRoot, buffer: AudioBuffer, timestamp: number, when: number) {
+	#scheduleBuffer(root: AudioNode, buffer: AudioBuffer, timestamp: number, when: number) {
 		const source = root.context.createBufferSource();
 		source.buffer = buffer;
-		source.connect(root.node);
+		source.connect(root);
 		source.onended = () => {
 			// Remove ourselves from the active list.
 			// This is super gross and probably wrong, but yolo.
@@ -316,6 +231,87 @@ export class Audio {
 		source.start(when);
 
 		this.#active.push({ node: source, timestamp });
+	}
+
+	close() {
+		this.#signals.close();
+	}
+}
+
+export type AudioEmitterProps = {
+	volume?: number;
+	muted?: boolean;
+	paused?: boolean;
+};
+
+// A helper that emits audio directly to the speakers.
+export class AudioEmitter {
+	source: Audio;
+	volume: Signal<number>;
+	muted: Signal<boolean>;
+
+	// Similar to muted, but controls whether we download audio at all.
+	// That way we can be "muted" but also download audio for visualizations.
+	paused: Signal<boolean>;
+
+	#signals = new Root();
+
+	// The volume to use when unmuted.
+	#unmuteVolume = 0.5;
+
+	// The gain node used to adjust the volume.
+	#gain = new Signal<GainNode | undefined>(undefined);
+
+	constructor(source: Audio, props?: AudioEmitterProps) {
+		this.source = source;
+		this.volume = new Signal(props?.volume ?? 0.5);
+		this.muted = new Signal(props?.muted ?? false);
+		this.paused = new Signal(props?.paused ?? props?.muted ?? false);
+
+		// Set the volume to 0 when muted.
+		this.#signals.effect((effect) => {
+			const muted = effect.get(this.muted);
+			if (muted) {
+				this.#unmuteVolume = this.volume.peek() || 0.5;
+				this.volume.set(0);
+				this.source.enabled.set(false);
+			} else {
+				this.volume.set(this.#unmuteVolume);
+				this.source.enabled.set(true);
+			}
+		});
+
+		// Set unmute when the volume is non-zero.
+		this.#signals.effect((effect) => {
+			const volume = effect.get(this.volume);
+			this.muted.set(volume === 0);
+		});
+
+		this.#signals.effect((effect) => {
+			const root = effect.get(this.source.root);
+			if (!root) return;
+
+			const gain = new GainNode(root.context, { gain: effect.get(this.volume) });
+			root.connect(gain);
+
+			gain.connect(root.context.destination); // speakers
+			effect.cleanup(() => gain.disconnect());
+
+			this.#gain.set(gain);
+			effect.cleanup(() => this.#gain.set(undefined));
+		});
+
+		this.#signals.effect((effect) => {
+			const gain = effect.get(this.#gain);
+			if (!gain) return;
+
+			const volume = effect.get(this.volume);
+			gain.gain.value = volume;
+		});
+
+		this.#signals.effect((effect) => {
+			this.source.enabled.set(!effect.get(this.paused));
+		});
 	}
 
 	close() {

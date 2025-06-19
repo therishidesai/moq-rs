@@ -1,3 +1,4 @@
+import solid from "@kixelated/signals/solid";
 import { Match, Show, Switch } from "solid-js";
 import { JSX } from "solid-js/jsx-runtime";
 import { AudioEmitter } from "./audio";
@@ -33,6 +34,7 @@ export function Controls(props: {
 }
 
 function Pause(props: { video: VideoRenderer }): JSX.Element {
+	const paused = solid(props.video.paused);
 	const togglePause = (e: MouseEvent) => {
 		e.preventDefault();
 		props.video.paused.set((prev) => !prev);
@@ -40,7 +42,7 @@ function Pause(props: { video: VideoRenderer }): JSX.Element {
 
 	return (
 		<button title="Pause" type="button" onClick={togglePause}>
-			<Show when={props.video.paused.get()} fallback={<>⏸️</>}>
+			<Show when={paused()} fallback={<>⏸️</>}>
 				▶️
 			</Show>
 		</button>
@@ -48,24 +50,22 @@ function Pause(props: { video: VideoRenderer }): JSX.Element {
 }
 
 function Volume(props: { audio: AudioEmitter }): JSX.Element {
-	const volume = props.audio.volume;
-	const muted = props.audio.muted;
+	const volume = solid(props.audio.volume);
 
 	const changeVolume = (str: string) => {
 		const v = Number.parseFloat(str) / 100;
-		volume.set(v);
+		props.audio.volume.set(v);
 	};
 
 	const toggleMute = () => {
-		muted.set((p) => !p);
+		props.audio.muted.set((p) => !p);
 	};
-
-	const rounded = () => Math.round(volume.get() * 100);
+	const rounded = () => Math.round(volume() * 100);
 
 	return (
 		<div style={{ display: "flex", "align-items": "center", gap: "0.25rem" }}>
 			<button title="Mute" type="button" onClick={toggleMute}>
-				<Show when={volume.get() === 0} fallback={<>🔊</>}>
+				<Show when={volume() === 0} fallback={<>🔊</>}>
 					🔇
 				</Show>
 			</button>
@@ -73,7 +73,7 @@ function Volume(props: { audio: AudioEmitter }): JSX.Element {
 				type="range"
 				min="0"
 				max="100"
-				value={volume.get() * 100}
+				value={volume() * 100}
 				onInput={(e) => changeVolume(e.currentTarget.value)}
 			/>
 			<span style={{ display: "inline-block", width: "2em", "text-align": "right" }}>{rounded()}%</span>
@@ -82,9 +82,9 @@ function Volume(props: { audio: AudioEmitter }): JSX.Element {
 }
 
 function Status(props: { broadcast: Broadcast }): JSX.Element {
-	const url = props.broadcast.connection.url.get;
-	const connection = props.broadcast.connection.status.get;
-	const broadcast = props.broadcast.status.get;
+	const url = solid(props.broadcast.connection.url);
+	const connection = solid(props.broadcast.connection.status);
+	const broadcast = solid(props.broadcast.status);
 
 	return (
 		<div>

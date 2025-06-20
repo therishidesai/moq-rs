@@ -1,93 +1,172 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map, HashMap};
 use tokio::sync::mpsc;
-use web_async::{Lock, LockWeak};
+use web_async::Lock;
 
 use super::BroadcastConsumer;
 
+// If there are multiple broadcasts with the same path, we use the most recent one but keep the others around.
+struct BroadcastState {
+	active: BroadcastConsumer,
+	backup: Vec<BroadcastConsumer>,
+}
+
 #[derive(Default)]
 struct ProducerState {
-	active: HashMap<String, BroadcastConsumer>,
-	consumers: Vec<(Lock<ConsumerState>, mpsc::Sender<()>)>,
+	active: HashMap<String, BroadcastState>,
+	consumers: Vec<ConsumerState>,
 }
 
 impl ProducerState {
-	fn publish(&mut self, path: String, broadcast: BroadcastConsumer) -> Option<BroadcastConsumer> {
-		let mut i = 0;
-
-		while let Some((consumer, notify)) = self.consumers.get(i) {
-			if !notify.is_closed() {
-				if consumer.lock().insert(&path, &broadcast) {
-					notify.try_send(()).ok();
+	fn publish(&mut self, path: String, broadcast: BroadcastConsumer) {
+		match self.active.entry(path.clone()) {
+			hash_map::Entry::Occupied(mut entry) => {
+				let state = entry.get_mut();
+				if state.active.is_clone(&broadcast) {
+					tracing::warn!(?path, "skipping duplicate publish");
+					return;
 				}
-				i += 1;
-			} else {
-				self.consumers.swap_remove(i);
-			}
-		}
 
-		self.active.insert(path, broadcast)
+				// Make the new broadcast the active one.
+				let old = state.active.clone();
+				state.active = broadcast.clone();
+
+				// Move the old broadcast to the backup list.
+				// But we need to replace any previous duplicates.
+				let pos = state.backup.iter().position(|b| b.is_clone(&broadcast));
+				if let Some(pos) = pos {
+					state.backup[pos] = old;
+				} else {
+					state.backup.push(old);
+				}
+
+				// Reannounce the path to all consumers.
+				retain_mut_unordered(&mut self.consumers, |c| c.remove(&path));
+			}
+			hash_map::Entry::Vacant(entry) => {
+				entry.insert(BroadcastState {
+					active: broadcast.clone(),
+					backup: Vec::new(),
+				});
+			}
+		};
+
+		retain_mut_unordered(&mut self.consumers, |c| c.insert(&path, &broadcast));
 	}
 
-	fn consume<T: ToString>(&mut self, prefix: T) -> ConsumerState {
-		let prefix = prefix.to_string();
-		let mut updates = VecDeque::new();
+	fn remove(&mut self, path: String, broadcast: BroadcastConsumer) {
+		let mut entry = match self.active.entry(path) {
+			hash_map::Entry::Occupied(entry) => entry,
+			hash_map::Entry::Vacant(_) => panic!("broadcast not found"),
+		};
 
-		for (path, broadcast) in self.active.iter() {
-			if let Some(suffix) = path.strip_prefix(&prefix) {
-				updates.push_back((suffix.to_string(), broadcast.clone()));
-			}
+		// See if we can remove the broadcast from the backup list.
+		let pos = entry.get().backup.iter().position(|b| b.is_clone(&broadcast));
+		if let Some(pos) = pos {
+			entry.get_mut().backup.remove(pos);
+			// Nothing else to do
+			return;
 		}
 
-		ConsumerState { prefix, updates }
-	}
+		// Okay so it must be the active broadcast or else we fucked up.
+		assert!(entry.get().active.is_clone(&broadcast));
 
-	fn subscribe(&mut self, consumer: Lock<ConsumerState>) -> mpsc::Receiver<()> {
-		let (tx, rx) = mpsc::channel(1);
-		self.consumers.push((consumer.clone(), tx));
-		rx
+		retain_mut_unordered(&mut self.consumers, |c| c.remove(entry.key()));
+
+		// If there's a backup broadcast, then announce it.
+		if let Some(active) = entry.get_mut().backup.pop() {
+			entry.get_mut().active = active;
+			retain_mut_unordered(&mut self.consumers, |c| c.insert(entry.key(), &entry.get().active));
+		} else {
+			// No more backups, so remove the entry.
+			entry.remove();
+		}
 	}
 }
 
-#[derive(Clone)]
+impl Drop for ProducerState {
+	fn drop(&mut self) {
+		for (path, _) in self.active.drain() {
+			retain_mut_unordered(&mut self.consumers, |c| c.remove(&path));
+		}
+	}
+}
+
+// A faster version of retain_mut that doesn't maintain the order.
+fn retain_mut_unordered<T, F: Fn(&mut T) -> bool>(vec: &mut Vec<T>, f: F) {
+	let mut i = 0;
+	while let Some(item) = vec.get_mut(i) {
+		if f(item) {
+			i += 1;
+		} else {
+			vec.swap_remove(i);
+		}
+	}
+}
+
+/// A broadcast path and its associated broadcast, or None if closed.
+type ConsumerUpdate = (String, Option<BroadcastConsumer>);
+
 struct ConsumerState {
 	prefix: String,
-	updates: VecDeque<(String, BroadcastConsumer)>,
+	updates: mpsc::UnboundedSender<ConsumerUpdate>,
 }
 
 impl ConsumerState {
+	// Returns true if the consuemr is still alive.
 	pub fn insert(&mut self, path: &str, consumer: &BroadcastConsumer) -> bool {
 		if let Some(suffix) = path.strip_prefix(&self.prefix) {
-			self.updates.push_back((suffix.to_string(), consumer.clone()));
-			true
+			let update = (suffix.to_string(), Some(consumer.clone()));
+			self.updates.send(update).is_ok()
 		} else {
-			false
+			!self.updates.is_closed()
+		}
+	}
+
+	pub fn remove(&mut self, path: &str) -> bool {
+		if let Some(suffix) = path.strip_prefix(&self.prefix) {
+			let update = (suffix.to_string(), None);
+			self.updates.send(update).is_ok()
+		} else {
+			!self.updates.is_closed()
 		}
 	}
 }
 
 /// Announces broadcasts to consumers over the network.
-#[derive(Default, Clone)]
+#[derive(Clone, Default)]
 pub struct OriginProducer {
 	state: Lock<ProducerState>,
 }
 
 impl OriginProducer {
 	pub fn new() -> Self {
-		Self::default()
+		Self {
+			state: Lock::new(ProducerState {
+				active: HashMap::new(),
+				consumers: Vec::new(),
+			}),
+		}
 	}
 
-	/// Announce a broadcast, returning true if it was unique.
-	pub fn publish<S: ToString>(&mut self, path: S, broadcast: BroadcastConsumer) -> bool {
+	/// Publish a broadcast, announcing it to all consumers.
+	///
+	/// The broadcast will be unannounced when it is closed.
+	/// If there is already a broadcast with the same path, then it will be replaced and reannounced.
+	/// If the old broadcast is closed before the new one, then nothing will happen.
+	/// If the new broadcast is closed before the old one, then the old broadcast will be reannounced.
+	pub fn publish<S: ToString>(&mut self, path: S, broadcast: BroadcastConsumer) {
 		let path = path.to_string();
-		let unique = self.state.lock().publish(path.clone(), broadcast.clone()).is_none();
+		self.state.lock().publish(path.clone(), broadcast.clone());
 
-		let state = self.state.clone();
+		let state = self.state.clone().downgrade();
+
+		// TODO cancel this task when the producer is dropped.
 		web_async::spawn(async move {
 			broadcast.closed().await;
-			state.lock().active.remove(&path);
+			if let Some(state) = state.upgrade() {
+				state.lock().remove(path, broadcast);
+			}
 		});
-
-		unique
 	}
 
 	/// Publish all broadcasts from the given origin.
@@ -108,6 +187,13 @@ impl OriginProducer {
 
 		web_async::spawn(async move {
 			while let Some((suffix, broadcast)) = broadcasts.next().await {
+				let broadcast = match broadcast {
+					Some(broadcast) => broadcast,
+					// We don't need to worry about unannouncements here because our own OriginPublisher will handle it.
+					// Announcements are ordered so I don't think there's a race condition?
+					None => continue,
+				};
+
 				let path = match &prefix {
 					Some(prefix) => format!("{}{}", prefix, suffix),
 					None => suffix,
@@ -119,8 +205,10 @@ impl OriginProducer {
 	}
 
 	/// Get a specific broadcast by name.
+	///
+	/// The most recent, non-closed broadcast will be returned if there are duplicates.
 	pub fn consume(&self, path: &str) -> Option<BroadcastConsumer> {
-		self.state.lock().active.get(path).cloned()
+		self.state.lock().active.get(path).map(|b| b.active.clone())
 	}
 
 	/// Subscribe to all announced broadcasts.
@@ -131,9 +219,19 @@ impl OriginProducer {
 	/// Subscribe to all announced broadcasts matching the prefix.
 	pub fn consume_prefix<S: ToString>(&self, prefix: S) -> OriginConsumer {
 		let mut state = self.state.lock();
-		let consumer = Lock::new(state.consume(prefix));
-		let notify = state.subscribe(consumer.clone());
-		OriginConsumer::new(self.state.downgrade(), consumer, notify)
+
+		let (tx, rx) = mpsc::unbounded_channel();
+		let mut consumer = ConsumerState {
+			prefix: prefix.to_string(),
+			updates: tx,
+		};
+
+		for (prefix, broadcast) in &state.active {
+			consumer.insert(prefix, &broadcast.active);
+		}
+		state.consumers.push(consumer);
+
+		OriginConsumer::new(rx)
 	}
 
 	/// Wait until all consumers have been dropped.
@@ -147,12 +245,12 @@ impl OriginProducer {
 	}
 
 	// Returns the closed notify of any consumer.
-	fn unused_inner(&self) -> Option<mpsc::Sender<()>> {
+	fn unused_inner(&self) -> Option<mpsc::UnboundedSender<ConsumerUpdate>> {
 		let mut state = self.state.lock();
 
-		while let Some((_, notify)) = state.consumers.last() {
-			if !notify.is_closed() {
-				return Some(notify.clone());
+		while let Some(consumer) = state.consumers.last() {
+			if !consumer.updates.is_closed() {
+				return Some(consumer.updates.clone());
 			}
 
 			state.consumers.pop();
@@ -164,54 +262,164 @@ impl OriginProducer {
 
 /// Consumes announced broadcasts matching against an optional prefix.
 pub struct OriginConsumer {
-	producer: LockWeak<ProducerState>,
-	state: Lock<ConsumerState>,
-	notify: mpsc::Receiver<()>,
+	updates: mpsc::UnboundedReceiver<ConsumerUpdate>,
 }
 
 impl OriginConsumer {
-	fn new(producer: LockWeak<ProducerState>, state: Lock<ConsumerState>, notify: mpsc::Receiver<()>) -> Self {
-		Self {
-			producer,
-			state,
-			notify,
-		}
+	fn new(updates: mpsc::UnboundedReceiver<ConsumerUpdate>) -> Self {
+		Self { updates }
 	}
 
-	/// Returns the next announced broadcast.
-	pub async fn next(&mut self) -> Option<(String, BroadcastConsumer)> {
-		loop {
-			{
-				let mut state = self.state.lock();
-
-				if let Some(update) = state.updates.pop_front() {
-					return Some(update);
-				}
-			}
-
-			self.notify.recv().await?;
-		}
+	/// Returns the next (un)announced broadcast and the path.
+	///
+	/// The broadcast will only be None if it was previously Some.
+	/// The same path won't be announced/unannounced twice, instead it will toggle.
+	pub async fn next(&mut self) -> Option<ConsumerUpdate> {
+		self.updates.recv().await
 	}
 }
 
-// ugh
-// Cloning consumers is problematic because it encourages idle consumers.
-// It's also just a pain in the butt to implement.
-// TODO figure out a way to remove this.
-impl Clone for OriginConsumer {
-	fn clone(&self) -> Self {
-		let consumer = Lock::new(self.state.lock().clone());
+#[cfg(test)]
+use futures::FutureExt;
 
-		match self.producer.upgrade() {
-			Some(producer) => {
-				let mut producer = producer.lock();
-				let notify = producer.subscribe(consumer.clone());
-				OriginConsumer::new(self.producer.clone(), consumer, notify)
-			}
-			None => {
-				let (_, notify) = mpsc::channel(1);
-				OriginConsumer::new(self.producer.clone(), consumer, notify)
-			}
-		}
+#[cfg(test)]
+impl OriginConsumer {
+	pub fn assert_next(&mut self, path: &str, broadcast: &BroadcastConsumer) {
+		let next = self.next().now_or_never().expect("next blocked").expect("no next");
+		assert_eq!(next.0, path, "wrong path");
+		assert!(next.1.unwrap().is_clone(broadcast), "should be the same broadcast");
+	}
+
+	pub fn assert_next_none(&mut self, path: &str) {
+		let next = self.next().now_or_never().expect("next blocked").expect("no next");
+		assert_eq!(next.0, path, "wrong path");
+		assert!(next.1.is_none(), "should be unannounced");
+	}
+
+	pub fn assert_next_wait(&mut self) {
+		assert!(self.next().now_or_never().is_none(), "next should block");
+	}
+
+	pub fn assert_next_closed(&mut self) {
+		assert!(
+			self.next().now_or_never().expect("next blocked").is_none(),
+			"next should be closed"
+		);
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use crate::BroadcastProducer;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn test_announce() {
+		let mut producer = OriginProducer::new();
+		let broadcast1 = BroadcastProducer::new();
+		let broadcast2 = BroadcastProducer::new();
+
+		// Make a new consumer that should get it.
+		let mut consumer1 = producer.consume_all();
+		consumer1.assert_next_wait();
+
+		// Publish the first broadcast.
+		producer.publish("test1", broadcast1.consume());
+
+		consumer1.assert_next("test1", &broadcast1.consume());
+		consumer1.assert_next_wait();
+
+		// Make a new consumer that should get the existing broadcast.
+		// But we don't consume it yet.
+		let mut consumer2 = producer.consume_all();
+
+		// Publish the second broadcast.
+		producer.publish("test2", broadcast2.consume());
+
+		consumer1.assert_next("test2", &broadcast2.consume());
+		consumer1.assert_next_wait();
+
+		consumer2.assert_next("test1", &broadcast1.consume());
+		consumer2.assert_next("test2", &broadcast2.consume());
+		consumer2.assert_next_wait();
+
+		// Close the first broadcast.
+		drop(broadcast1);
+
+		// Wait for the async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
+		// All consumers should get a None now.
+		consumer1.assert_next_none("test1");
+		consumer2.assert_next_none("test1");
+		consumer1.assert_next_wait();
+		consumer2.assert_next_wait();
+
+		// And a new consumer only gets the last broadcast.
+		let mut consumer3 = producer.consume_all();
+		consumer3.assert_next("test2", &broadcast2.consume());
+		consumer3.assert_next_wait();
+
+		// Close the producer and make sure it cleans up
+		drop(producer);
+
+		// Wait for the async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+
+		consumer1.assert_next_none("test2");
+		consumer2.assert_next_none("test2");
+		consumer3.assert_next_none("test2");
+
+		consumer1.assert_next_closed();
+		consumer2.assert_next_closed();
+		consumer3.assert_next_closed();
+	}
+
+	#[tokio::test]
+	async fn test_duplicate() {
+		let mut producer = OriginProducer::new();
+		let broadcast1 = BroadcastProducer::new();
+		let broadcast2 = BroadcastProducer::new();
+
+		producer.publish("test", broadcast1.consume());
+		producer.publish("test", broadcast2.consume());
+		assert!(producer.consume("test").is_some());
+
+		drop(broadcast1);
+
+		// Wait for the async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+		assert!(producer.consume("test").is_some());
+
+		drop(broadcast2);
+
+		// Wait for the async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+		assert!(producer.consume("test").is_none());
+	}
+
+	#[tokio::test]
+	async fn test_duplicate_reverse() {
+		let mut producer = OriginProducer::new();
+		let broadcast1 = BroadcastProducer::new();
+		let broadcast2 = BroadcastProducer::new();
+
+		producer.publish("test", broadcast1.consume());
+		producer.publish("test", broadcast2.consume());
+		assert!(producer.consume("test").is_some());
+
+		// This is harder, dropping the new broadcast first.
+		drop(broadcast2);
+
+		// Wait for the cleanup async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+		assert!(producer.consume("test").is_some());
+
+		drop(broadcast1);
+
+		// Wait for the cleanup async task to run.
+		tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+		assert!(producer.consume("test").is_none());
 	}
 }

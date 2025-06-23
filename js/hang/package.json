@@ -11,13 +11,20 @@
 		"./publish/element": "./src/publish/element.tsx",
 		"./watch": "./src/watch/index.ts",
 		"./watch/element": "./src/watch/element.tsx",
+		"./meet": "./src/meet/index.ts",
+		"./meet/element": "./src/meet/element.tsx",
 		"./catalog": "./src/catalog/index.ts",
 		"./container": "./src/container/index.ts",
 		"./support": "./src/support/index.ts",
 		"./support/element": "./src/support/element.tsx",
 		"./connection": "./src/connection.ts"
 	},
-	"sideEffects": ["./src/publish/element.ts", "./src/watch/element.ts", "./src/support/element.ts"],
+	"sideEffects": [
+		"./src/publish/element.ts",
+		"./src/watch/element.ts",
+		"./src/support/element.ts",
+		"./src/meet/element.tsx"
+	],
 	"files": ["./src", "./dist", "README.md", "tsconfig.json"],
 	"scripts": {
 		"build": "vite build && tsc -b",
@@ -34,6 +41,7 @@
 		"solid-js": "^1.9.7"
 	},
 	"devDependencies": {
+		"@types/audioworklet": "^0.0.77",
 		"@typescript/lib-dom": "npm:@types/web@^0.0.241",
 		"fast-glob": "^3.3.3",
 		"typescript": "^5.8.3",

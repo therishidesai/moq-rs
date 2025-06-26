@@ -2,6 +2,9 @@ import * as Moq from "@kixelated/moq";
 import { type Computed, type Effect, Root, Signal } from "@kixelated/signals";
 import type * as Catalog from "../catalog";
 import * as Container from "../container";
+import type * as Worklet from "../worklet";
+
+import WORKLET_URL from "../worklet/capture?worker&url";
 
 // Create a group every half a second
 const GOP_DURATION = 0.5;
@@ -50,8 +53,8 @@ export class Audio {
 	muted: Signal<boolean>;
 	volume: Signal<number>;
 
-	readonly media: Signal<AudioTrack | undefined>;
-	readonly constraints: Signal<AudioConstraints | undefined>;
+	media: Signal<AudioTrack | undefined>;
+	constraints: Signal<AudioConstraints | undefined>;
 
 	#catalog = new Signal<Catalog.Audio | undefined>(undefined);
 	readonly catalog = this.#catalog.readonly();
@@ -109,14 +112,15 @@ export class Audio {
 		effect.cleanup(() => gain.disconnect());
 
 		// Async because we need to wait for the worklet to be registered.
-		// We load the worklet from a string because bundlers are dumb.
-		context.audioWorklet.addModule(`data:text/javascript,(${worklet.toString()})()`).then(() => {
+		context.audioWorklet.addModule(WORKLET_URL).then(() => {
 			const worklet = new AudioWorkletNode(context, "capture", {
 				numberOfInputs: 1,
 				numberOfOutputs: 0,
 				channelCount: settings.channelCount,
 			});
+
 			this.#worklet.set(worklet);
+			effect.cleanup(() => this.#worklet.set(undefined));
 
 			gain.connect(worklet);
 			effect.cleanup(() => worklet.disconnect());
@@ -152,9 +156,9 @@ export class Audio {
 		if (!worklet) return;
 
 		const track = new Moq.TrackProducer(`audio-${this.#id++}`, 1);
-		this.broadcast.insertTrack(track.consume());
-
 		effect.cleanup(() => track.close());
+
+		this.broadcast.insertTrack(track.consume());
 		effect.cleanup(() => this.broadcast.removeTrack(track.name));
 
 		const settings = media.getSettings() as AudioTrackSettings;
@@ -171,7 +175,7 @@ export class Audio {
 				sampleRate: settings.sampleRate ?? worklet?.context.sampleRate,
 				numberOfChannels: settings.channelCount,
 				// TODO configurable
-				bitrate: 64_000,
+				bitrate: settings.channelCount * 32_000,
 			},
 		};
 
@@ -211,7 +215,7 @@ export class Audio {
 			bitrate: config.bitrate,
 		});
 
-		worklet.port.onmessage = ({ data }: { data: WorkletMessage }) => {
+		worklet.port.onmessage = ({ data }: { data: Worklet.AudioFrame }) => {
 			const channels = data.channels.slice(0, settings.channelCount);
 			const joinedLength = channels.reduce((a, b) => a + b.length, 0);
 			const joined = new Float32Array(joinedLength);
@@ -239,40 +243,4 @@ export class Audio {
 	close() {
 		this.#signals.close();
 	}
-}
-
-interface WorkletMessage {
-	timestamp: number;
-	channels: Float32Array[];
-}
-
-// NOTE: This runs on the AudioWorklet thread, so it doesn't actually have full capabilities.
-// We could use a separate tsconfig.json for this but it's a pain in the butt getting bundlers to work.
-// WARN: // and # will break things, hence the /* */ comments.
-// One day I'll figure out how to make worklets actually work with bundlers.
-function worklet() {
-	/* @ts-expect-error - No audio worklet types. */
-	registerProcessor(
-		"capture",
-		/* @ts-expect-error - No audio worklet types. */
-		class Processor extends AudioWorkletProcessor {
-			sampleCount = 0;
-
-			process(input: Float32Array[][]) {
-				if (input.length > 1) throw new Error("only one input is supported.");
-				const channels = input[0];
-
-				const message: WorkletMessage = {
-					timestamp: this.sampleCount,
-					channels,
-				};
-
-				/* @ts-expect-error - No audio worklet types. */
-				this.port.postMessage(message);
-
-				this.sampleCount += channels[0].length;
-				return true;
-			}
-		},
-	);
 }

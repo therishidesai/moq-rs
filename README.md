@@ -70,8 +70,10 @@ Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
 ### Easier Mode
 - [Direnv](https://direnv.net/)
 
-Then you'll no longer need to type `nix shell -c` before each command.
-It will automatically apply the Nix shell when you change into the directory.
+```sh
+# Applies the nix shell within the repo.
+just all
+```
 
 ### Hard Mode
 Or if you don't like Nix, you can install dependencies manually.

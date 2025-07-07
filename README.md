@@ -34,7 +34,7 @@ nix shell -c just all
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
 Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
-If that command is too long, install [Direnv](https://direnv.net/) then only `just all` is required.
+If that command is too long, install [nix-direnv](https://direnv.net/](https://github.com/nix-community/nix-direnv) so only `just all` is required.
 
 
 ### Hard Mode

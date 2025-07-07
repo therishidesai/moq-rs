@@ -24,7 +24,7 @@ Built on modern web technologies like [WebTransport](https://developer.mozilla.o
 
 ## Demo
 This repository is split into multiple binaries and libraries across different languages.
-It can get overwhelming, so there's an included [js/hang-demo](demo) with some examples.
+It can get overwhelming, so there's an included [demo](js/hang-demo) with some examples.
 
 **Note:** this demo uses an insecure HTTP fetch intended for *local development only*.
 In production, you'll need a proper domain and a matching TLS certificate via [LetsEncrypt](https://letsencrypt.org/docs/) or similar.

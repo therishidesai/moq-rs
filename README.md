@@ -23,8 +23,10 @@ Built on modern web technologies like [WebTransport](https://developer.mozilla.o
 
 
 ## Setup
-### Easy Mode
-- [Nix](https://nixos.org/download.html) + [Flakes](https://nixos.wiki/wiki/Flakes)
+### Quick Setup
+**Requirements:**
+- [Nix](https://nixos.org/download.html)
+- [Nix Flakes enabled](https://nixos.wiki/wiki/Flakes)
 
 ```sh
 # Runs a relay, demo media, and the web server
@@ -34,15 +36,16 @@ nix shell -c just all
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
 Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
-If that command is too long, install [nix-direnv](https://direnv.net/](https://github.com/nix-community/nix-direnv) so only `just all` is required.
+*TIP:* If you've installed [nix-direnv](https://direnv.net/](https://github.com/nix-community/nix-direnv), then only `just all` is required.
 
 
-### Hard Mode
-Or if you don't like Nix, you can install dependencies manually.
+### Full Setup
+If you don't like Nix, or just want things install globally, then you can install dependencies manually.
 
+**Requirements:**
+- [Just](https://github.com/casey/just)
 - [Rust](https://www.rust-lang.org/tools/install)
 - [Node.js](https://nodejs.org/)
-- [Just](https://github.com/casey/just)
 - [pnpm](https://pnpm.io/)
 - [FFmpeg](https://ffmpeg.org/download.html)
 - [GStreamer](https://gstreamer.freedesktop.org/documentation/installing/index.html) (optional)
@@ -50,7 +53,7 @@ Or if you don't like Nix, you can install dependencies manually.
 
 **Run it:**
 ```sh
-# Install some additional dependencies
+# Install some more dependencies
 just setup
 
 # Runs a relay, demo media, and the web server
@@ -58,6 +61,7 @@ just all
 ```
 
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
+Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
 
 ## Architecture

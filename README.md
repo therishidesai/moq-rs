@@ -24,7 +24,7 @@ Built on modern web technologies like [WebTransport](https://developer.mozilla.o
 
 ## Setup
 ### Easy Mode
-- [Nix](https://nixos.org/download.html)
+- [Nix](https://nixos.org/download.html) + [Flakes](https://nixos.wiki/wiki/Flakes)
 
 ```sh
 # Runs a relay, demo media, and the web server
@@ -32,14 +32,10 @@ nix shell -c just all
 ```
 
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
+Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
-### Easier Mode
-- [Direnv](https://direnv.net/)
+If that command is too long, install [Direnv](https://direnv.net/) then only `just all` is required.
 
-```sh
-# Applies the nix shell within the repo.
-just all
-```
 
 ### Hard Mode
 Or if you don't like Nix, you can install dependencies manually.

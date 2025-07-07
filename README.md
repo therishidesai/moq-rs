@@ -22,40 +22,6 @@ Built on modern web technologies like [WebTransport](https://developer.mozilla.o
 > **Note:** This project is a [fork](https://quic.video/blog/transfork) of the [IETF MoQ specification](https://datatracker.ietf.org/group/moq/documents/). The focus is narrower, focusing on simplicity and deployability.
 
 
-## Architecture
-
-MoQ is designed as a layered protocol stack.
-
-**Rule 1**: The CDN MUST NOT know anything about your application, media codecs, or even the available tracks.
-Everything could be fully E2EE and the CDN wouldn't care. **No business logic allowed**.
-
-Instead, [`moq-relay`](rs/moq-relay) operates on rules encoded in the [`moq-lite`](https://docs.rs/moq-lite) header.
-These rules are based on video encoding but are generic enough to be used for any live data.
-The goal is to keep the server as dumb as possible while supporting a wide range of use-cases.
-
-The media logic is split into another protocol called [`hang`](https://docs.rs/hang).
-It's pretty simple and only intended to be used by clients or media servers.
-If you want to do something more custom, then you can always extend it or replace it entirely.
-
-Think of `hang` as like HLS/DASH, while `moq-lite` is like HTTP.
-
-
-```
-┌─────────────────┐
-│   Application   │   🏢 Your business logic
-│                 │    - authentication, non-media tracks, etc.
-├─────────────────┤
-│      hang       │   🎬 Media-specific encoding/streaming
-│                 │     - codecs, containers, catalog
-├─────────────────├
-│    moq-lite     │  🚌 Generic pub/sub transport
-│                 │     - broadcasts, tracks, groups, frames
-├─────────────────┤
-│  WebTransport   │  🌐 Browser-compatible QUIC
-│      QUIC       │     - HTTP/3 handshake, multiplexing, etc.
-└─────────────────┘
-```
-
 ## Setup
 ### Easy Mode
 - [Nix](https://nixos.org/download.html)
@@ -96,6 +62,41 @@ just all
 ```
 
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
+
+
+## Architecture
+
+MoQ is designed as a layered protocol stack.
+
+**Rule 1**: The CDN MUST NOT know anything about your application, media codecs, or even the available tracks.
+Everything could be fully E2EE and the CDN wouldn't care. **No business logic allowed**.
+
+Instead, [`moq-relay`](rs/moq-relay) operates on rules encoded in the [`moq-lite`](https://docs.rs/moq-lite) header.
+These rules are based on video encoding but are generic enough to be used for any live data.
+The goal is to keep the server as dumb as possible while supporting a wide range of use-cases.
+
+The media logic is split into another protocol called [`hang`](https://docs.rs/hang).
+It's pretty simple and only intended to be used by clients or media servers.
+If you want to do something more custom, then you can always extend it or replace it entirely.
+
+Think of `hang` as like HLS/DASH, while `moq-lite` is like HTTP.
+
+
+```
+┌─────────────────┐
+│   Application   │   🏢 Your business logic
+│                 │    - authentication, non-media tracks, etc.
+├─────────────────┤
+│      hang       │   🎬 Media-specific encoding/streaming
+│                 │     - codecs, containers, catalog
+├─────────────────├
+│    moq-lite     │  🚌 Generic pub/sub transport
+│                 │     - broadcasts, tracks, groups, frames
+├─────────────────┤
+│  WebTransport   │  🌐 Browser-compatible QUIC
+│      QUIC       │     - HTTP/3 handshake, multiplexing, etc.
+└─────────────────┘
+```
 
 
 ## Libraries

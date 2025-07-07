@@ -1,11 +1,11 @@
+<p align="center">
+	<img height="128px" src="https://github.com/kixelated/moq/blob/main/.github/logo.svg" alt="Media over QUIC">
+</p>
+
 ![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue)
 [![Discord](https://img.shields.io/discord/1124083992740761730)](https://discord.gg/FCYF3p99mr)
 [![Crates.io](https://img.shields.io/crates/v/moq-lite)](https://crates.io/crates/moq-lite)
 [![npm](https://img.shields.io/npm/v/@kixelated/moq)](https://www.npmjs.com/package/@kixelated/moq)
-
-<p align="center">
-	<img height="128px" src="https://github.com/kixelated/moq/blob/main/.github/logo.svg" alt="Media over QUIC">
-</p>
 
 # Media over QUIC
 
@@ -36,7 +36,7 @@ nix shell -c just all
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
 Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
-*TIP:* If you've installed [nix-direnv](https://direnv.net/](https://github.com/nix-community/nix-direnv), then only `just all` is required.
+*TIP:* If you've installed [nix-direnv](https://github.com/nix-community/nix-direnv), then only `just all` is required.
 
 
 ### Full Setup

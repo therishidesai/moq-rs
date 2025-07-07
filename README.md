@@ -22,7 +22,14 @@ Built on modern web technologies like [WebTransport](https://developer.mozilla.o
 > **Note:** This project is a [fork](https://quic.video/blog/transfork) of the [IETF MoQ specification](https://datatracker.ietf.org/group/moq/documents/). The focus is narrower, focusing on simplicity and deployability.
 
 
-## Setup
+## Demo
+This repository is split into multiple binaries and libraries across different languages.
+It can get overwhelming, so there's an included [js/hang-demo](demo) with some examples.
+
+**Note:** this demo uses an insecure HTTP fetch intended for *local development only*.
+In production, you'll need a proper domain and a matching TLS certificate via [LetsEncrypt](https://letsencrypt.org/docs/) or similar.
+
+
 ### Quick Setup
 **Requirements:**
 - [Nix](https://nixos.org/download.html)
@@ -61,7 +68,6 @@ just all
 ```
 
 Then visit [https://localhost:8080](https://localhost:8080) to see the demo.
-Note that this uses an insecure HTTP fetch for local development only; in production you'll need a proper domain + TLS certificate.
 
 
 ## Architecture
@@ -129,7 +135,6 @@ Read the specifications:
 - [hang](https://kixelated.github.io/moq-drafts/draft-lcurley-hang.html)
 - [use-cases](https://kixelated.github.io/moq-drafts/draft-lcurley-moq-use-cases.html)
 
-
 ## Development
 ```sh
 # See all available commands
@@ -151,6 +156,7 @@ just web      # Terminal 3: Start web server
 ```
 
 There are more commands: check out the [Justfile](Justfile), [rs/Justfile](rs/Justfile), and [js/Justfile](js/Justfile).
+
 
 ## License
 

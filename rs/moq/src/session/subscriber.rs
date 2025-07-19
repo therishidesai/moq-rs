@@ -4,89 +4,66 @@ use std::{
 };
 
 use crate::{
-	message,
-	model::{BroadcastConsumer, BroadcastProducer},
-	Error, Frame, FrameProducer, Group, GroupProducer, OriginProducer, TrackProducer,
+	message, model::BroadcastProducer, Error, Frame, FrameProducer, Group, GroupProducer, OriginProducer, Path,
+	TrackProducer,
 };
 
 use web_async::{spawn, Lock};
 
-use super::{OriginConsumer, Reader, Stream};
+use super::{Reader, Stream};
 
 #[derive(Clone)]
-pub(super) struct Subscriber {
+pub(super) struct SessionSubscriber {
 	session: web_transport::Session,
 
-	broadcasts: Lock<HashMap<String, BroadcastProducer>>,
+	broadcasts: Lock<HashMap<Path, BroadcastProducer>>,
 	subscribes: Lock<HashMap<u64, TrackProducer>>,
 	next_id: Arc<atomic::AtomicU64>,
 }
 
-impl Subscriber {
+impl SessionSubscriber {
 	pub fn new(session: web_transport::Session) -> Self {
 		Self {
 			session,
-
 			broadcasts: Default::default(),
 			subscribes: Default::default(),
 			next_id: Default::default(),
 		}
 	}
 
-	/// Consume any broadcasts matching a prefix.
-	pub fn consume_prefix<T: ToString>(&self, prefix: T) -> OriginConsumer {
-		let prefix = prefix.to_string();
-
-		let producer = OriginProducer::new();
-		let consumer = producer.consume_prefix(prefix.clone());
-
-		web_async::spawn(self.clone().run_announced(prefix, producer));
-
-		consumer
-	}
-
-	async fn run_announced(mut self, prefix: String, producer: OriginProducer) {
-		tracing::debug!(?prefix, "announced started");
-
-		// Keep running until we don't care about the producer anymore.
-		let closed = producer.clone();
+	pub async fn run(self, origin: OriginProducer) -> Result<(), Error> {
+		let closed = origin.clone();
 
 		// Wait until the producer is no longer needed or the stream is closed.
-		let res = tokio::select! {
+		tokio::select! {
+			biased; // avoid run_inner if we're already unused
+			// Nobody wants to consume from this origin anymore.
 			_ = closed.unused() => Err(Error::Cancel),
-			res = self.run_broadcasts(&prefix, producer) => res,
-		};
-
-		match res {
-			Err(Error::Cancel) => tracing::trace!(%prefix, "announced cancelled"),
-			Err(err) => tracing::trace!(?err, %prefix, "announced error"),
-			_ => tracing::trace!(%prefix, "announced complete"),
+			res = self.run_inner(origin) => res,
 		}
 	}
 
-	async fn run_broadcasts(&mut self, prefix: &str, mut announced: OriginProducer) -> Result<(), Error> {
+	async fn run_inner(mut self, mut origin: OriginProducer) -> Result<(), Error> {
 		let mut stream = Stream::open(&mut self.session, message::ControlType::Announce).await?;
 
-		let msg = message::AnnounceRequest {
-			prefix: prefix.to_string(),
-		};
+		let msg = message::AnnounceRequest { prefix: "".into() };
 		stream.writer.encode(&msg).await?;
 
 		let mut producers = HashMap::new();
 
 		while let Some(announce) = stream.reader.decode_maybe::<message::Announce>().await? {
 			match announce {
-				message::Announce::Active { suffix } => {
-					tracing::debug!(%suffix, "received announce");
+				message::Announce::Active { suffix: path } => {
+					tracing::debug!(broadcast = %path, "received announce");
 
 					let producer = BroadcastProducer::new();
 					let consumer = producer.consume();
 
 					// Run the broadcast in the background until all consumers are dropped.
-					announced.publish(suffix.clone(), consumer);
-					producers.insert(suffix.clone(), producer.clone());
+					origin.publish(&path, consumer);
+					producers.insert(path.clone(), producer.clone());
 
-					spawn(self.clone().run_broadcast(suffix, producer));
+					spawn(self.clone().run_broadcast(path, producer));
 				}
 				message::Announce::Ended { suffix } => {
 					tracing::debug!(%suffix, "received unannounce");
@@ -102,42 +79,7 @@ impl Subscriber {
 		stream.writer.finish().await
 	}
 
-	/// Discover and consume a specific broadcast.
-	///
-	/// This is different from `consume` because it waits for an announcement.
-	pub fn consume_exact<T: ToString>(&self, path: T) -> OriginConsumer {
-		let path = path.to_string();
-
-		let producer = OriginProducer::new();
-
-		// Consume an exact path, not a prefix.
-		let consumer = producer.consume_exact(path.clone());
-
-		// TODO: Optimize this, we don't need/want to download the entire prefix.
-		web_async::spawn(self.clone().run_announced(path, producer));
-
-		consumer
-	}
-
-	/// Subscribe to a specific broadcast.
-	///
-	/// TODO: This BroadcastConsumer may not be active and is never closed because it doesn't rely on announce.
-	pub fn consume(&self, path: &str) -> BroadcastConsumer {
-		if let Some(producer) = self.broadcasts.lock().get(path) {
-			return producer.consume();
-		}
-
-		let path = path.to_string();
-		let producer = BroadcastProducer::new();
-		let consumer = producer.consume();
-
-		// Run the broadcast in the background until all consumers are dropped.
-		spawn(self.clone().run_broadcast(path, producer));
-
-		consumer
-	}
-
-	async fn run_broadcast(self, path: String, mut broadcast: BroadcastProducer) {
+	async fn run_broadcast(self, path: Path, mut broadcast: BroadcastProducer) {
 		// Actually start serving subscriptions.
 		loop {
 			// Keep serving requests until there are no more consumers.
@@ -152,9 +94,9 @@ impl Subscriber {
 			};
 
 			let id = self.next_id.fetch_add(1, atomic::Ordering::Relaxed);
-			let path = path.clone();
 			let mut this = self.clone();
 
+			let path = path.clone();
 			spawn(async move {
 				this.run_subscribe(id, path, track).await;
 				this.subscribes.lock().remove(&id);
@@ -165,7 +107,7 @@ impl Subscriber {
 		self.broadcasts.lock().remove(&path);
 	}
 
-	async fn run_subscribe(&mut self, id: u64, broadcast: String, track: TrackProducer) {
+	async fn run_subscribe(&mut self, id: u64, broadcast: Path, track: TrackProducer) {
 		self.subscribes.lock().insert(id, track.clone());
 
 		let msg = message::Subscribe {
@@ -184,15 +126,15 @@ impl Subscriber {
 
 		match res {
 			Err(Error::Cancel) | Err(Error::WebTransport(_)) => {
-				tracing::debug!(broadcast = %broadcast, track = %track.info.name, id, "subscribe cancelled");
+				tracing::debug!(%broadcast, track = %track.info.name, id, "subscribe cancelled");
 				track.abort(Error::Cancel);
 			}
 			Err(err) => {
-				tracing::warn!(?err, broadcast = %broadcast, track = %track.info.name, id, "subscribe error");
+				tracing::warn!(?err, %broadcast, track = %track.info.name, id, "subscribe error");
 				track.abort(err);
 			}
 			_ => {
-				tracing::debug!(broadcast = %broadcast, track = %track.info.name, id, "subscribe complete");
+				tracing::debug!(%broadcast, track = %track.info.name, id, "subscribe complete");
 				track.finish();
 			}
 		}

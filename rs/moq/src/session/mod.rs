@@ -1,6 +1,4 @@
-use crate::{message, BroadcastConsumer, Error, OriginConsumer};
-
-use web_async::spawn;
+use crate::{message, Error, OriginConsumer, OriginProducer};
 
 mod publisher;
 mod reader;
@@ -14,35 +12,39 @@ use stream::*;
 use subscriber::*;
 use writer::*;
 
-/// A MoQ session, used to publish and/or subscribe to broadcasts.
+/// A MoQ session, constructed with [Publisher] and [Subscriber] halves.
 ///
-/// A publisher will [Self::publish] tracks, or alternatively [Self::announce] and [Self::route] arbitrary paths.
-/// A subscriber will [Self::subscribe] to tracks, or alternatively use [Self::announced] to discover arbitrary paths.
+/// This simplifies the state machine and immediately rejects any subscriptions that don't match the origin prefix.
+/// You probably want to use [Session] unless you're writing a relay.
 #[derive(Clone)]
 pub struct Session {
-	webtransport: web_transport::Session,
-	publisher: Publisher,
-	subscriber: Subscriber,
+	pub webtransport: web_transport::Session,
 }
 
 impl Session {
-	fn new(mut session: web_transport::Session, stream: Stream) -> Self {
-		tracing::info!("session started");
-
-		let publisher = Publisher::new(session.clone());
-		let subscriber = Subscriber::new(session.clone());
+	fn new(
+		mut session: web_transport::Session,
+		stream: Stream,
+		// We will publish any local broadcasts from this origin.
+		publish: Option<OriginConsumer>,
+		// We will consume any remote broadcasts, inserting them into this origin.
+		subscribe: Option<OriginProducer>,
+	) -> Self {
+		let publisher = SessionPublisher::new(session.clone(), publish);
+		let subscriber = SessionSubscriber::new(session.clone());
 
 		let this = Self {
 			webtransport: session.clone(),
-			publisher: publisher.clone(),
-			subscriber: subscriber.clone(),
 		};
 
-		spawn(async move {
+		web_async::spawn(async move {
 			let res = tokio::select! {
 				res = Self::run_session(stream) => res,
-				res = Self::run_bi(session.clone(), publisher) => res,
-				res = Self::run_uni(session.clone(), subscriber) => res,
+				res = Self::run_bi(session.clone(), publisher.clone()) => res,
+				res = Self::run_uni(session.clone(), subscriber.clone()) => res,
+				//res = publisher.run() => res,
+				// Ignore Ok (unused) or when subscribe is None.
+				Some(Err(res)) = async move { Some(subscriber.run(subscribe?).await) } => Err(res),
 			};
 
 			match res {
@@ -65,11 +67,19 @@ impl Session {
 	}
 
 	/// Perform the MoQ handshake as a client.
-	pub async fn connect<T: Into<web_transport::Session>>(session: T) -> Result<Self, Error> {
+	pub async fn connect<
+		T: Into<web_transport::Session>,
+		P: Into<Option<OriginConsumer>>,
+		C: Into<Option<OriginProducer>>,
+	>(
+		session: T,
+		publish: P,
+		subscribe: C,
+	) -> Result<Self, Error> {
 		let mut session = session.into();
 		let mut stream = Stream::open(&mut session, message::ControlType::Session).await?;
 		Self::connect_setup(&mut stream).await?;
-		Ok(Self::new(session, stream))
+		Ok(Self::new(session, stream, publish.into(), subscribe.into()))
 	}
 
 	async fn connect_setup(setup: &mut Stream) -> Result<(), Error> {
@@ -87,7 +97,15 @@ impl Session {
 	}
 
 	/// Perform the MoQ handshake as a server
-	pub async fn accept<T: Into<web_transport::Session>>(session: T) -> Result<Self, Error> {
+	pub async fn accept<
+		T: Into<web_transport::Session>,
+		P: Into<Option<OriginConsumer>>,
+		C: Into<Option<OriginProducer>>,
+	>(
+		session: T,
+		publish: P,
+		subscribe: C,
+	) -> Result<Self, Error> {
 		let mut session = session.into();
 		let mut stream = Stream::accept(&mut session).await?;
 		let kind = stream.reader.decode().await?;
@@ -97,7 +115,7 @@ impl Session {
 		}
 
 		Self::accept_setup(&mut stream).await?;
-		Ok(Self::new(session, stream))
+		Ok(Self::new(session, stream, publish.into(), subscribe.into()))
 	}
 
 	async fn accept_setup(control: &mut Stream) -> Result<(), Error> {
@@ -124,18 +142,18 @@ impl Session {
 		Err(Error::Cancel)
 	}
 
-	async fn run_uni(mut session: web_transport::Session, subscriber: Subscriber) -> Result<(), Error> {
+	async fn run_uni(mut session: web_transport::Session, subscriber: SessionSubscriber) -> Result<(), Error> {
 		loop {
 			let stream = Reader::accept(&mut session).await?;
 			let subscriber = subscriber.clone();
 
-			spawn(async move {
+			web_async::spawn(async move {
 				Self::run_data(stream, subscriber).await.ok();
 			});
 		}
 	}
 
-	async fn run_data(mut stream: Reader, mut subscriber: Subscriber) -> Result<(), Error> {
+	async fn run_data(mut stream: Reader, mut subscriber: SessionSubscriber) -> Result<(), Error> {
 		let kind = stream.decode().await?;
 
 		let res = match kind {
@@ -149,18 +167,18 @@ impl Session {
 		Ok(())
 	}
 
-	async fn run_bi(mut session: web_transport::Session, publisher: Publisher) -> Result<(), Error> {
+	async fn run_bi(mut session: web_transport::Session, publisher: SessionPublisher) -> Result<(), Error> {
 		loop {
 			let stream = Stream::accept(&mut session).await?;
 			let publisher = publisher.clone();
 
-			spawn(async move {
+			web_async::spawn(async move {
 				Self::run_control(stream, publisher).await.ok();
 			});
 		}
 	}
 
-	async fn run_control(mut stream: Stream, mut publisher: Publisher) -> Result<(), Error> {
+	async fn run_control(mut stream: Stream, mut publisher: SessionPublisher) -> Result<(), Error> {
 		let kind = stream.reader.decode().await?;
 
 		let res = match kind {
@@ -174,52 +192,6 @@ impl Session {
 		}
 
 		res
-	}
-
-	/// Publish a broadcast, automatically announcing and serving it.
-	pub fn publish<T: ToString>(&mut self, path: T, broadcast: BroadcastConsumer) {
-		self.publisher.publish(path, broadcast);
-	}
-
-	/// Publish all broadcasts from the given origin with a prefix.
-	pub fn publish_prefix(&mut self, prefix: &str, broadcasts: OriginConsumer) {
-		self.publisher.publish_prefix(prefix, broadcasts);
-	}
-
-	/// Publish all broadcasts from the given origin.
-	pub fn publish_all(&mut self, broadcasts: OriginConsumer) {
-		self.publisher.publish_all(broadcasts);
-	}
-
-	/// Consume a broadcast, returning a handle that can request tracks.
-	///
-	/// No tracks flow over the network until [BroadcastConsumer::subscribe] is called.
-	pub fn consume(&self, path: &str) -> BroadcastConsumer {
-		self.subscriber.consume(path)
-	}
-
-	/// Discover and consume all broadcasts.
-	///
-	/// No tracks flow over the network until [BroadcastConsumer::subscribe] is called.
-	pub fn consume_all(&self) -> OriginConsumer {
-		self.subscriber.consume_prefix("")
-	}
-
-	/// Discover and consume any broadcasts published by the remote matching a prefix.
-	///
-	/// No tracks flow over the network until [BroadcastConsumer::subscribe] is called.
-	pub fn consume_prefix<S: ToString>(&self, prefix: S) -> OriginConsumer {
-		self.subscriber.consume_prefix(prefix)
-	}
-
-	/// Discover and consume a specific broadcast.
-	///
-	/// This is different from `consume` because it waits for an announcement.
-	/// The returned OriginConsumer will ONLY announce a suffix="".
-	///
-	/// TODO: Make a special class for this.
-	pub fn consume_exact(&self, path: &str) -> OriginConsumer {
-		self.subscriber.consume_exact(path)
 	}
 
 	/// Close the underlying WebTransport session.

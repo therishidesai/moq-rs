@@ -150,8 +150,8 @@ export class Connection {
 	 * Publishes a broadcast to the connection.
 	 * @param broadcast - The broadcast to publish
 	 */
-	publish(path: string, broadcast: BroadcastConsumer) {
-		this.#publisher.publish(path, broadcast);
+	publish(name: string, broadcast: BroadcastConsumer) {
+		this.#publisher.publish(name, broadcast);
 	}
 
 	/**

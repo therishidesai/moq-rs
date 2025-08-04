@@ -1,11 +1,9 @@
 {
 	"extends": "../tsconfig.json",
 	"include": ["src"],
-	"exclude": ["node_modules", "dist", "src/worklet", "src/worker"],
+	"exclude": ["node_modules", "dist"],
 	"compilerOptions": {
 		"outDir": "dist",
-		"jsx": "react-jsx",
-		"jsxImportSource": "solid-js",
 		"rootDir": "./src"
 	}
 }

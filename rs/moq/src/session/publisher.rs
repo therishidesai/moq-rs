@@ -1,8 +1,6 @@
 use web_async::FuturesExt;
 
-use crate::{
-	message, model::GroupConsumer, Error, OriginConsumer, OriginProducer, OriginUpdate, Path, Track, TrackConsumer,
-};
+use crate::{message, model::GroupConsumer, Error, Origin, OriginAnnounce, OriginConsumer, Path, Track, TrackConsumer};
 
 use super::{Stream, Writer};
 
@@ -14,8 +12,8 @@ pub(super) struct Publisher {
 
 impl Publisher {
 	pub fn new(session: web_transport::Session, origin: Option<OriginConsumer>) -> Self {
-		// Create a dummy origin that is immediately closed.
-		let origin = origin.unwrap_or_else(|| OriginProducer::default().consume_all());
+		// Default to a dummy origin that is immediately closed.
+		let origin = origin.unwrap_or_else(|| Origin::produce().consumer);
 		Self { session, origin }
 	}
 
@@ -78,13 +76,13 @@ impl Publisher {
 			.ok_or(Error::Unauthorized)?
 			.to_owned();
 
-		let mut announced = self.origin.consume_prefix(&prefix);
+		let mut announced = self.origin.with_prefix(&prefix);
 
 		let mut init = Vec::new();
 
 		// Send ANNOUNCE_INIT as the first message with all currently active paths
 		// We use `try_next()` to synchronously get the initial updates.
-		while let Some(OriginUpdate { suffix, active }) = announced.try_next() {
+		while let Some(OriginAnnounce { suffix, active }) = announced.try_announced() {
 			let full = self.origin.root().join(&prefix).join(&suffix);
 			if active.is_some() {
 				tracing::debug!(broadcast = %full, "announce");
@@ -103,10 +101,10 @@ impl Publisher {
 		loop {
 			tokio::select! {
 				biased;
-				res = stream.reader.finished() => return res,
-				announced = announced.next() => {
+				res = stream.reader.closed() => return res,
+				announced = announced.announced() => {
 					match announced {
-						Some(OriginUpdate { suffix, active }) => {
+						Some(OriginAnnounce { suffix, active }) => {
 							let full = self.origin.root().join(&prefix).join(&suffix);
 							if active.is_some() {
 								tracing::debug!(broadcast = %full, "announce");
@@ -118,7 +116,7 @@ impl Publisher {
 								stream.writer.encode(&msg).await?;
 							}
 						},
-						None => return stream.writer.finish().await,
+						None => return stream.writer.close().await,
 					}
 				}
 			}
@@ -159,8 +157,8 @@ impl Publisher {
 			.strip_prefix(self.origin.prefix())
 			.ok_or(Error::Unauthorized)?;
 
-		let broadcast = self.origin.consume(&path).ok_or(Error::NotFound)?;
-		let track = broadcast.subscribe(&track);
+		let broadcast = self.origin.get_broadcast(&path).ok_or(Error::NotFound)?;
+		let track = broadcast.subscribe_track(&track);
 
 		// TODO wait until track.info() to get the *real* priority
 
@@ -172,10 +170,10 @@ impl Publisher {
 
 		tokio::select! {
 			res = self.run_track(track, subscribe) => res?,
-			res = stream.reader.finished() => res?,
+			res = stream.reader.closed() => res?,
 		}
 
-		stream.writer.finish().await
+		stream.writer.close().await
 	}
 
 	async fn run_track(&mut self, mut track: TrackConsumer, subscribe: &mut message::Subscribe) -> Result<(), Error> {
@@ -281,7 +279,7 @@ impl Publisher {
 				let chunk = tokio::select! {
 					biased;
 					_ = stream.closed() => return Err(Error::Cancel),
-					chunk = frame.read() => chunk,
+					chunk = frame.read_chunk() => chunk,
 				};
 
 				match chunk? {
@@ -291,7 +289,7 @@ impl Publisher {
 			}
 		}
 
-		stream.finish().await?;
+		stream.close().await?;
 
 		Ok(())
 	}

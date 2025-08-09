@@ -12,7 +12,7 @@ use std::future::Future;
 use bytes::Bytes;
 use tokio::sync::watch;
 
-use crate::{Error, Result};
+use crate::{Error, Produce, Result};
 
 use super::{Frame, FrameConsumer, FrameProducer};
 
@@ -23,8 +23,10 @@ pub struct Group {
 }
 
 impl Group {
-	pub fn produce(self) -> GroupProducer {
-		GroupProducer::new(self)
+	pub fn produce(self) -> Produce<GroupProducer, GroupConsumer> {
+		let producer = GroupProducer::new(self);
+		let consumer = producer.consume();
+		Produce { producer, consumer }
 	}
 }
 
@@ -63,7 +65,7 @@ struct GroupState {
 	// The frames that has been written thus far
 	frames: Vec<FrameConsumer>,
 
-	// Whether the group is finished
+	// Whether the group is closed
 	closed: Option<Result<()>>,
 }
 
@@ -78,7 +80,7 @@ pub struct GroupProducer {
 }
 
 impl GroupProducer {
-	pub fn new(info: Group) -> Self {
+	fn new(info: Group) -> Self {
 		Self {
 			info,
 			state: Default::default(),
@@ -87,7 +89,7 @@ impl GroupProducer {
 
 	/// A helper method to write a frame from a single byte buffer.
 	///
-	/// If you want to write multiple chunks, use [Self::create_frame] or [Self::append_frame].
+	/// If you want to write multiple chunks, use [Self::create] or [Self::append].
 	/// But an upfront size is required.
 	pub fn write_frame<B: Into<Bytes>>(&mut self, frame: B) {
 		let data = frame.into();
@@ -95,15 +97,15 @@ impl GroupProducer {
 			size: data.len() as u64,
 		};
 		let mut frame = self.create_frame(frame);
-		frame.write(data);
-		frame.finish();
+		frame.write_chunk(data);
+		frame.close();
 	}
 
 	/// Create a frame with an upfront size
 	pub fn create_frame(&mut self, info: Frame) -> FrameProducer {
-		let producer = FrameProducer::new(info);
-		self.append_frame(producer.consume());
-		producer
+		let frame = Frame::produce(info);
+		self.append_frame(frame.consumer);
+		frame.producer
 	}
 
 	/// Append a frame to the group.
@@ -115,7 +117,7 @@ impl GroupProducer {
 	}
 
 	// Clean termination of the group.
-	pub fn finish(self) {
+	pub fn close(self) {
 		self.state.send_modify(|state| state.closed = Some(Ok(())));
 	}
 

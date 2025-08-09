@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::{Audio, Video};
 use crate::Result;
+use moq_lite::Produce;
 
 use super::Location;
 
@@ -81,14 +82,20 @@ impl Catalog {
 	}
 
 	/// Produce a catalog track that describes the available media tracks.
-	pub fn produce(self) -> CatalogProducer {
-		let track = moq_lite::Track {
+	pub fn produce(self) -> Produce<CatalogProducer, CatalogConsumer> {
+		let track = Catalog::default_track().produce();
+
+		Produce {
+			producer: CatalogProducer::new(track.producer, self),
+			consumer: track.consumer.into(),
+		}
+	}
+
+	pub fn default_track() -> moq_lite::Track {
+		moq_lite::Track {
 			name: Catalog::DEFAULT_NAME.to_string(),
 			priority: 100,
 		}
-		.produce();
-
-		CatalogProducer::new(track, self)
 	}
 }
 
@@ -105,7 +112,7 @@ pub struct CatalogProducer {
 
 impl CatalogProducer {
 	/// Create a new catalog producer with the given track and initial catalog.
-	pub fn new(track: moq_lite::TrackProducer, init: Catalog) -> Self {
+	fn new(track: moq_lite::TrackProducer, init: Catalog) -> Self {
 		Self {
 			current: Arc::new(Mutex::new(init)),
 			track,
@@ -159,7 +166,7 @@ impl CatalogProducer {
 		// TODO decide if this should return an error, or be impossible to fail
 		let frame = current.to_string().expect("invalid catalog");
 		group.write_frame(frame);
-		group.finish();
+		group.close();
 	}
 
 	/// Create a consumer for this catalog, receiving updates as they're [published](Self::publish).
@@ -168,26 +175,14 @@ impl CatalogProducer {
 	}
 
 	/// Finish publishing to this catalog and close the track.
-	pub fn finish(self) {
-		self.track.finish();
+	pub fn close(self) {
+		self.track.close();
 	}
 }
 
 impl From<moq_lite::TrackProducer> for CatalogProducer {
 	fn from(inner: moq_lite::TrackProducer) -> Self {
 		Self::new(inner, Catalog::default())
-	}
-}
-
-impl Default for CatalogProducer {
-	fn default() -> Self {
-		let track = moq_lite::Track {
-			name: Catalog::DEFAULT_NAME.to_string(),
-			priority: 100,
-		}
-		.produce();
-
-		CatalogProducer::new(track, Catalog::default())
 	}
 }
 

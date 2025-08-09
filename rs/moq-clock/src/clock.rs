@@ -65,7 +65,7 @@ impl Publisher {
 			now = next;
 		}
 
-		segment.finish();
+		segment.close();
 
 		Ok(())
 	}

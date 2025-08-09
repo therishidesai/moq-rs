@@ -3,7 +3,7 @@ use std::future::Future;
 use bytes::{Bytes, BytesMut};
 use tokio::sync::watch;
 
-use crate::{Error, Result};
+use crate::{Error, Produce, Result};
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -12,8 +12,10 @@ pub struct Frame {
 }
 
 impl Frame {
-	pub fn produce(self) -> FrameProducer {
-		FrameProducer::new(self)
+	pub fn produce(self) -> Produce<FrameProducer, FrameConsumer> {
+		let producer = FrameProducer::new(self);
+		let consumer = producer.consume();
+		Produce { producer, consumer }
 	}
 }
 
@@ -64,7 +66,7 @@ pub struct FrameProducer {
 }
 
 impl FrameProducer {
-	pub fn new(info: Frame) -> Self {
+	fn new(info: Frame) -> Self {
 		Self {
 			info,
 			state: Default::default(),
@@ -72,7 +74,7 @@ impl FrameProducer {
 		}
 	}
 
-	pub fn write<B: Into<Bytes>>(&mut self, chunk: B) {
+	pub fn write_chunk<B: Into<Bytes>>(&mut self, chunk: B) {
 		let chunk = chunk.into();
 		self.written += chunk.len();
 		assert!(self.written <= self.info.size as usize);
@@ -83,7 +85,7 @@ impl FrameProducer {
 		});
 	}
 
-	pub fn finish(self) {
+	pub fn close(self) {
 		assert!(self.written == self.info.size as usize);
 		self.state.send_modify(|state| state.closed = Some(Ok(())));
 	}
@@ -132,7 +134,7 @@ pub struct FrameConsumer {
 
 impl FrameConsumer {
 	// Return the next chunk.
-	pub async fn read(&mut self) -> Result<Option<Bytes>> {
+	pub async fn read_chunk(&mut self) -> Result<Option<Bytes>> {
 		loop {
 			{
 				let state = self.state.borrow_and_update();

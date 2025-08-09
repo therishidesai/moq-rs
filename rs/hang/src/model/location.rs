@@ -88,7 +88,7 @@ impl LocationProducer {
 		buffer.put_f32(position.zoom);
 
 		group.write_frame(buffer);
-		group.finish();
+		group.close();
 
 		*self.latest.lock().unwrap() = Some(position);
 	}
@@ -102,7 +102,7 @@ impl LocationProducer {
 		Ok(())
 	}
 
-	pub fn finish(self) {
-		self.track.finish();
+	pub fn close(self) {
+		self.track.close();
 	}
 }

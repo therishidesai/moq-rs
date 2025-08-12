@@ -1,6 +1,5 @@
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use moq_lite::Path;
 use std::{io, path::PathBuf};
 
 #[derive(Debug, Parser)]
@@ -39,10 +38,11 @@ enum Commands {
 		#[arg(long, default_value = "")]
 		root: String,
 
-		/// If specified, the user can publish any matching broadcasts.
+		/// If specified, the user can publish any matching path prefixes.
 		/// If not specified, the user will not publish any broadcasts.
+		/// This can be specified multiple times to publish multiple paths.
 		#[arg(long)]
-		publish: Option<String>,
+		publish: Vec<String>,
 
 		/// If true, then this client is considered a cluster node.
 		/// Both the client and server will only announce broadcasts from non-cluster clients.
@@ -50,10 +50,11 @@ enum Commands {
 		#[arg(long)]
 		cluster: bool,
 
-		/// If specified, the user can subscribe to any matching broadcasts.
+		/// If specified, the user can subscribe to any matching path prefixes.
 		/// If not specified, the user will not receive announcements and cannot subscribe to any broadcasts.
+		/// This can be specified multiple times to subscribe to multiple paths.
 		#[arg(long)]
-		subscribe: Option<String>,
+		subscribe: Vec<String>,
 
 		/// The expiration time of the token as a unix timestamp.
 		#[arg(long, value_parser = parse_unix_timestamp)]
@@ -90,10 +91,10 @@ fn main() -> anyhow::Result<()> {
 			let key = moq_token::Key::from_file(cli.key)?;
 
 			let payload = moq_token::Claims {
-				root: Path::new(root),
-				publish: publish.map(Path::new),
+				root,
+				publish,
 				cluster,
-				subscribe: subscribe.map(Path::new),
+				subscribe,
 				expires,
 				issued,
 			};

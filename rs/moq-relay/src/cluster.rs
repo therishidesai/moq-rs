@@ -1,9 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use anyhow::Context;
-use moq_lite::{
-	Broadcast, BroadcastConsumer, BroadcastProducer, Origin, OriginAnnounce, OriginConsumer, OriginProducer,
-};
+use moq_lite::{AsPath, Broadcast, BroadcastConsumer, BroadcastProducer, Origin, OriginConsumer, OriginProducer};
 use tracing::Instrument;
 use url::Url;
 
@@ -33,7 +31,7 @@ pub struct ClusterConfig {
 		default_value = "internal/origins",
 		env = "MOQ_CLUSTER_PREFIX"
 	)]
-	pub prefix: moq_lite::Path,
+	pub prefix: String,
 }
 
 #[derive(Clone)]
@@ -45,13 +43,13 @@ pub struct Cluster {
 	noop: moq_lite::Produce<BroadcastProducer, BroadcastConsumer>,
 
 	// Broadcasts announced by local clients (users).
-	pub primary: moq_lite::Produce<OriginProducer, OriginConsumer>,
+	pub primary: Arc<moq_lite::Produce<OriginProducer, OriginConsumer>>,
 
 	// Broadcasts announced by remote servers (cluster).
-	pub secondary: moq_lite::Produce<OriginProducer, OriginConsumer>,
+	pub secondary: Arc<moq_lite::Produce<OriginProducer, OriginConsumer>>,
 
 	// Broadcasts announced by local clients and remote servers.
-	pub combined: moq_lite::Produce<OriginProducer, OriginConsumer>,
+	pub combined: Arc<moq_lite::Produce<OriginProducer, OriginConsumer>>,
 }
 
 impl Cluster {
@@ -59,21 +57,21 @@ impl Cluster {
 		Cluster {
 			config,
 			client,
-			primary: Origin::produce(),
 			noop: Broadcast::produce(),
-			secondary: Origin::produce(),
-			combined: Origin::produce(),
+			primary: Arc::new(Origin::produce()),
+			secondary: Arc::new(Origin::produce()),
+			combined: Arc::new(Origin::produce()),
 		}
 	}
 
 	pub fn get(&self, broadcast: &str) -> Option<BroadcastConsumer> {
 		self.primary
 			.consumer
-			.get_broadcast(broadcast)
-			.or_else(|| self.secondary.consumer.get_broadcast(broadcast))
+			.consume_broadcast(broadcast)
+			.or_else(|| self.secondary.consumer.consume_broadcast(broadcast))
 	}
 
-	pub async fn run(mut self) -> anyhow::Result<()> {
+	pub async fn run(self) -> anyhow::Result<()> {
 		let connect = match self.config.connect.clone() {
 			// If we're using a root node, then we have to connect to it.
 			Some(connect) if Some(&connect) != self.config.advertise.as_ref() => connect,
@@ -84,10 +82,12 @@ impl Cluster {
 			}
 		};
 
+		let prefix = self.config.prefix.as_path();
+
 		// Announce ourselves as an origin to the root node.
 		if let Some(myself) = self.config.advertise.as_ref() {
 			tracing::info!(%self.config.prefix, %myself, "announcing as leaf");
-			let name = self.config.prefix.join(myself);
+			let name = prefix.join(myself);
 			self.primary
 				.producer
 				.publish_broadcast(&name, self.noop.consumer.clone());
@@ -110,15 +110,12 @@ impl Cluster {
 	}
 
 	// Shovel broadcasts from the primary and secondary origins into the combined origin.
-	async fn run_combined(mut self) -> anyhow::Result<()> {
-		let mut primary = self.primary.consumer.clone();
-		let mut secondary = self.secondary.consumer.clone();
+	async fn run_combined(self) -> anyhow::Result<()> {
+		let mut primary = self.primary.consumer.consume();
+		let mut secondary = self.secondary.consumer.consume();
 
 		loop {
-			let OriginAnnounce {
-				suffix: name,
-				active: broadcast,
-			} = tokio::select! {
+			let (name, broadcast) = tokio::select! {
 				biased;
 				Some(primary) = primary.announced() => primary,
 				Some(secondary) = secondary.announced() => secondary,
@@ -133,7 +130,11 @@ impl Cluster {
 
 	async fn run_remotes(self, token: String) -> anyhow::Result<()> {
 		// Subscribe to available origins.
-		let mut origins = self.secondary.consumer.with_prefix(&self.config.prefix);
+		let mut origins = self
+			.secondary
+			.consumer
+			.consume_only(&[self.config.prefix.as_path()])
+			.context("no authorized origins")?;
 
 		// Cancel tasks when the origin is closed.
 		let mut active: HashMap<String, tokio::task::AbortHandle> = HashMap::new();
@@ -141,11 +142,7 @@ impl Cluster {
 		// Discover other origins.
 		// NOTE: The root node will connect to all other nodes as a client, ignoring the existing (server) connection.
 		// This ensures that nodes are advertising a valid hostname before any tracks get announced.
-		while let Some(OriginAnnounce {
-			suffix: node,
-			active: origin,
-		}) = origins.announced().await
-		{
+		while let Some((node, origin)) = origins.try_announced() {
 			if Some(node.as_str()) == self.config.advertise.as_deref() {
 				// Skip ourselves.
 				continue;
@@ -222,7 +219,7 @@ impl Cluster {
 			.await
 			.context("failed to connect to remote")?;
 
-		let publish = Some(self.primary.consumer.clone());
+		let publish = Some(self.primary.consumer.consume());
 		let subscribe = Some(self.secondary.producer.clone());
 
 		let session = moq_lite::Session::connect(conn, publish, subscribe)

@@ -21,39 +21,45 @@ impl Connection {
 			}
 		};
 
+		tracing::info!(token = ?token, "session accepted");
+
 		// Accept the connection.
 		let session = self.request.ok().await?;
 
 		// These broadcasts will be served to the session (when it subscribes).
-		let mut subscribe = None;
-		if let Some(prefix) = &token.subscribe {
-			// If this is a cluster node, then only publish our primary broadcasts.
-			// Otherwise publish everything.
-			let origin = match token.cluster {
-				true => &self.cluster.primary,
-				false => &self.cluster.combined,
-			};
+		// If this is a cluster node, then only publish our primary broadcasts.
+		// Otherwise publish everything.
+		let subscribe_origin = match token.cluster {
+			true => &self.cluster.primary,
+			false => &self.cluster.combined,
+		};
 
-			// Scope the origin to our root.
-			let origin = origin.producer.with_root(&token.root);
-			subscribe = Some(origin.consume_prefix(prefix));
+		// Scope the origin to our root.
+		let subscribe_origin = subscribe_origin.producer.with_root(&token.root).unwrap();
+		let subscribe = subscribe_origin.consume_only(&token.subscribe);
+
+		// If this is a cluster node, then add its broadcasts to the secondary origin.
+		// That way we won't publish them to other cluster nodes.
+		let publish_origin = match token.cluster {
+			true => &self.cluster.secondary,
+			false => &self.cluster.primary,
+		};
+
+		let publish_origin = publish_origin.producer.with_root(&token.root).unwrap();
+		let publish = publish_origin.publish_only(&token.publish);
+
+		match (&subscribe, &publish) {
+			(Some(subscribe), Some(publish)) => {
+				tracing::info!(root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "session accepted");
+			}
+			(Some(subscribe), None) => {
+				tracing::info!(root = %token.root, subscribe = %subscribe.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "subscriber accepted");
+			}
+			(None, Some(publish)) => {
+				tracing::info!(root = %token.root, publish = %publish.allowed().map(|p| p.as_str()).collect::<Vec<_>>().join(","), "publisher accepted")
+			}
+			_ => anyhow::bail!("invalid session; no allowed paths"),
 		}
-
-		// These broadcasts will be received from the session (when it publishes).
-		let mut publish = None;
-		if let Some(prefix) = &token.publish {
-			// If this is a cluster node, then add its broadcasts to the secondary origin.
-			// That way we won't publish them to other cluster nodes.
-			let origin = match token.cluster {
-				true => &self.cluster.secondary,
-				false => &self.cluster.primary,
-			};
-
-			let origin = origin.producer.with_root(&token.root);
-			publish = Some(origin.with_prefix(prefix))
-		}
-
-		tracing::info!(root = %token.root, subscribe = %subscribe.as_ref().map(|s| s.prefix().as_str()).unwrap_or("(none)"), publish = %publish.as_ref().map(|p| p.prefix().as_str()).unwrap_or("(none)"), "session accepted");
 
 		// NOTE: subscribe and publish seem backwards because of how relays work.
 		// We publish the tracks the client is allowed to subscribe to.

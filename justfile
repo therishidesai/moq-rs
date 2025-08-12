@@ -26,15 +26,12 @@ dev:
 	# Build the rust packages so `cargo run` has a head start.
 	cd rs && just build
 
-	# Generate auth tokens if needed
-	@cd rs && just auth
-
 	# Then run the relay with a slight head start.
 	# It doesn't matter if the web beats BBB because we support automatic reloading.
 	js/node_modules/.bin/concurrently --kill-others --names srv,bbb,web --prefix-colors auto \
 		"just relay" \
-		"sleep 1 && just pub bbb http://localhost:4443/demo?jwt=$(cat rs/dev/demo-pub.jwt)" \
-		"sleep 2 && just web http://localhost:4443/demo?jwt=$(cat rs/dev/demo-me.jwt)"
+		"sleep 1 && just pub bbb http://localhost:4443/anon" \
+		"sleep 2 && just web http://localhost:4443/anon"
 
 # Run a localhost relay server
 relay:
@@ -46,7 +43,7 @@ cluster:
 	cd js && pnpm i
 
 	# Generate auth tokens if needed
-	@cd rs && just auth
+	@cd rs && just auth-token
 
 	# Build the rust packages so `cargo run` has a head start.
 	cd rs && just build
@@ -55,13 +52,17 @@ cluster:
 	# Publish the funny bunny to the root node.
 	# Publish the robot fanfic to the leaf node.
 	js/node_modules/.bin/concurrently --kill-others --names root,leaf,bbb,tos,web --prefix-colors auto \
-		"just relay" \
+		"just root" \
 		"sleep 1 && just leaf" \
-		"sleep 2 && just pub bbb http://localhost:4444/demo?jwt=$(cat rs/dev/demo-pub.jwt)" \
-		"sleep 3 && just pub tos http://localhost:4443/demo?jwt=$(cat rs/dev/demo-pub.jwt)" \
-		"sleep 4 && just web http://localhost:4443/demo?jwt=$(cat rs/dev/demo-me.jwt)"
+		"sleep 2 && just pub bbb http://localhost:4444/demo?jwt=$(cat rs/dev/demo-cli.jwt)" \
+		"sleep 3 && just pub tos http://localhost:4443/demo?jwt=$(cat rs/dev/demo-cli.jwt)" \
+		"sleep 4 && just web http://localhost:4443/demo?jwt=$(cat rs/dev/demo-web.jwt)"
 
-# Run a leaf node
+# Run a root node, accepting connections from leaf nodes.
+root:
+	just --justfile rs/justfile root
+
+# Run a leaf node, connecting to the root node.
 leaf:
 	just --justfile rs/justfile leaf
 

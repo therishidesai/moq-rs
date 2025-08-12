@@ -6,13 +6,19 @@ use crate::{coding::*, Path};
 /// The payload contains the contents of the wildcard.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Announce {
-	Active { suffix: Path },
-	Ended { suffix: Path },
+pub enum Announce<'a> {
+	Active {
+		#[cfg_attr(feature = "serde", serde(borrow))]
+		suffix: Path<'a>,
+	},
+	Ended {
+		#[cfg_attr(feature = "serde", serde(borrow))]
+		suffix: Path<'a>,
+	},
 }
 
-impl Announce {
-	pub fn suffix(&self) -> &Path {
+impl<'a> Announce<'a> {
+	pub fn suffix(&self) -> &Path<'a> {
 		match self {
 			Announce::Active { suffix } => suffix,
 			Announce::Ended { suffix } => suffix,
@@ -20,7 +26,7 @@ impl Announce {
 	}
 }
 
-impl Message for Announce {
+impl<'a> Message for Announce<'a> {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		Ok(match AnnounceStatus::decode(r)? {
 			AnnounceStatus::Active => Self::Active {
@@ -48,12 +54,12 @@ impl Message for Announce {
 
 /// Sent by the subscriber to request ANNOUNCE messages.
 #[derive(Clone, Debug)]
-pub struct AnnouncePlease {
+pub struct AnnouncePlease<'a> {
 	// Request tracks with this prefix.
-	pub prefix: Path,
+	pub prefix: Path<'a>,
 }
 
-impl Message for AnnouncePlease {
+impl<'a> Message for AnnouncePlease<'a> {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		let prefix = Path::decode(r)?;
 		Ok(Self { prefix })
@@ -92,12 +98,13 @@ impl Encode for AnnounceStatus {
 /// Sent after setup to communicate the initially announced paths.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub struct AnnounceInit {
+pub struct AnnounceInit<'a> {
 	/// List of currently active broadcasts, encoded as suffixes to be combined with the prefix.
-	pub suffixes: Vec<Path>,
+	#[cfg_attr(feature = "serde", serde(borrow))]
+	pub suffixes: Vec<Path<'a>>,
 }
 
-impl Message for AnnounceInit {
+impl<'a> Message for AnnounceInit<'a> {
 	fn decode<R: bytes::Buf>(r: &mut R) -> Result<Self, DecodeError> {
 		let count = u64::decode(r)?;
 

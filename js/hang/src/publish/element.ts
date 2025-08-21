@@ -34,10 +34,17 @@ export default class HangPublish extends HTMLElement {
 		});
 
 		this.#signals.effect((effect) => {
+			if (!preview) return;
+
 			const media = effect.get(this.broadcast.video.media);
-			if (!media || !preview) return;
+			if (!media) {
+				preview.style.display = "none";
+				return;
+			}
 
 			preview.srcObject = new MediaStream([media]);
+			preview.style.display = "block";
+
 			effect.cleanup(() => {
 				preview.srcObject = null;
 			});
@@ -280,7 +287,7 @@ export default class HangPublish extends HTMLElement {
 			} else if (status === "connecting") {
 				container.textContent = "🟡\u00A0Connecting...";
 			} else if (!audio && !video) {
-				container.textContent = "🔴\u00A0Select Device";
+				container.textContent = "🟡\u00A0Select Device";
 			} else if (!audio && video) {
 				container.textContent = "🟡\u00A0Video Only";
 			} else if (audio && !video) {

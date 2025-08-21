@@ -34,6 +34,26 @@ export class VideoRenderer {
 
 		this.#signals.effect(this.#schedule.bind(this));
 		this.#signals.effect(this.#runEnabled.bind(this));
+
+		this.#signals.effect((effect) => {
+			const canvas = effect.get(this.canvas);
+			if (!canvas) return;
+
+			const info = effect.get(this.source.info);
+			if (info) {
+				// Initialize the canvas to the correct size.
+				// NOTE: each frame will resize the canvas, so this is mostly to avoid pop-in.
+				canvas.width = info.config.displayAspectWidth ?? info.config.codedWidth ?? 1;
+				canvas.height = info.config.displayAspectHeight ?? info.config.codedHeight ?? 1;
+			} else {
+				// Hide the canvas when no broadcast is selected.
+				const display = canvas.style.display;
+				canvas.style.display = "none";
+				effect.cleanup(() => {
+					canvas.style.display = display;
+				});
+			}
+		});
 	}
 
 	// Detect when video should be downloaded.

@@ -12,7 +12,7 @@ import { Speaking, type SpeakingProps } from "./speaking";
 
 export type AudioProps = {
 	// Enable to download the audio track.
-	enabled?: boolean;
+	enabled?: boolean | Signal<boolean>;
 
 	// The latency hint to use for the AudioContext.
 	latency?: DOMHighResTimeStamp;
@@ -62,7 +62,7 @@ export class Audio {
 	) {
 		this.broadcast = broadcast;
 		this.catalog = catalog;
-		this.enabled = new Signal(props?.enabled ?? false);
+		this.enabled = Signal.from(props?.enabled ?? false);
 		this.latency = props?.latency ?? 100; // TODO Reduce this once fMP4 stuttering is fixed.
 		this.captions = new Captions(broadcast, this.info, props?.captions);
 		this.speaking = new Speaking(broadcast, this.info, props?.speaking);
@@ -110,6 +110,9 @@ export class Audio {
 					this.#buffered = (1000 * available) / sampleRate;
 				}
 			};
+			effect.cleanup(() => {
+				worklet.port.onmessage = null;
+			});
 
 			worklet.port.postMessage({
 				type: "init",

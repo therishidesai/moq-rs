@@ -24,6 +24,13 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		this.#value = value;
 	}
 
+	static from<T>(value: T | Signal<T>): Signal<T> {
+		if (value instanceof Signal) {
+			return value;
+		}
+		return new Signal(value);
+	}
+
 	// TODO rename to get once we've ported everything
 	peek(): T {
 		return this.#value;
@@ -221,7 +228,9 @@ export class Effect {
 	// Spawn an async effect that blocks the effect being rerun until it completes.
 	// The cancel promise is resolved when the effect should cleanup: on close or rerun.
 	spawn(fn: (cancel: Promise<void>) => Promise<void>) {
-		const promise = fn(this.#stopped);
+		const promise = fn(this.#stopped).catch((error) => {
+			console.error("spawn error", error);
+		});
 
 		if (this.#dispose === undefined) {
 			if (DEV) {
@@ -320,67 +329,67 @@ export class Effect {
 	}
 
 	// Add an event listener that automatically removes on cleanup.
-	eventListener<K extends keyof HTMLElementEventMap>(
+	event<K extends keyof HTMLElementEventMap>(
 		target: HTMLElement,
 		type: K,
 		listener: (this: HTMLElement, ev: HTMLElementEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof SVGElementEventMap>(
+	event<K extends keyof SVGElementEventMap>(
 		target: SVGElement,
 		type: K,
 		listener: (this: SVGElement, ev: SVGElementEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof DocumentEventMap>(
+	event<K extends keyof DocumentEventMap>(
 		target: Document,
 		type: K,
 		listener: (this: Document, ev: DocumentEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof WindowEventMap>(
+	event<K extends keyof WindowEventMap>(
 		target: Window,
 		type: K,
 		listener: (this: Window, ev: WindowEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof WebSocketEventMap>(
+	event<K extends keyof WebSocketEventMap>(
 		target: WebSocket,
 		type: K,
 		listener: (this: WebSocket, ev: WebSocketEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof XMLHttpRequestEventMap>(
+	event<K extends keyof XMLHttpRequestEventMap>(
 		target: XMLHttpRequest,
 		type: K,
 		listener: (this: XMLHttpRequest, ev: XMLHttpRequestEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof MediaQueryListEventMap>(
+	event<K extends keyof MediaQueryListEventMap>(
 		target: MediaQueryList,
 		type: K,
 		listener: (this: MediaQueryList, ev: MediaQueryListEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof AnimationEventMap>(
+	event<K extends keyof AnimationEventMap>(
 		target: Animation,
 		type: K,
 		listener: (this: Animation, ev: AnimationEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener<K extends keyof EventSourceEventMap>(
+	event<K extends keyof EventSourceEventMap>(
 		target: EventSource,
 		type: K,
 		listener: (this: EventSource, ev: EventSourceEventMap[K]) => void,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener(
+	event(
 		target: EventTarget,
 		type: string,
 		listener: EventListenerOrEventListenerObject,
 		options?: boolean | AddEventListenerOptions,
 	): void;
-	eventListener(
+	event(
 		target: EventTarget,
 		type: string,
 		listener: EventListenerOrEventListenerObject,
@@ -395,6 +404,11 @@ export class Effect {
 
 		target.addEventListener(type, listener, options);
 		this.cleanup(() => target.removeEventListener(type, listener, options));
+	}
+
+	// Reschedule the effect to run again.
+	reload() {
+		this.#schedule();
 	}
 
 	// Register a cleanup function.

@@ -11,6 +11,8 @@ export * from "./captions";
 const GAIN_MIN = 0.001;
 const FADE_TIME = 0.2;
 
+export type Source = AudioStreamTrack;
+
 // Unfortunately, we need to use a Vite-exclusive import for now.
 import CaptureWorklet from "./capture-worklet?worker&url";
 import { Speaking, type SpeakingProps } from "./speaking";
@@ -21,13 +23,14 @@ export type AudioConstraints = Omit<
 >;
 
 // Stronger typing for the MediaStreamTrack interface.
-export interface AudioTrack extends MediaStreamTrack {
+export interface AudioStreamTrack extends MediaStreamTrack {
 	kind: "audio";
-	clone(): AudioTrack;
+	clone(): AudioStreamTrack;
+	getSettings(): AudioTrackSettings;
 }
 
 // MediaTrackSettings can represent both audio and video, which means a LOT of possibly undefined properties.
-// This is a fork of the MediaTrackSettings interface with properties required for audio or vidfeo.
+// This is a fork of the MediaTrackSettings interface with properties required for audio or video.
 export interface AudioTrackSettings {
 	deviceId: string;
 	groupId: string;
@@ -42,12 +45,11 @@ export interface AudioTrackSettings {
 
 // The initial values for our signals.
 export type AudioProps = {
-	enabled?: boolean;
-	media?: AudioTrack;
-	constraints?: AudioConstraints;
+	enabled?: boolean | Signal<boolean>;
+	source?: Source | Signal<Source | undefined>;
 
-	muted?: boolean;
-	volume?: number;
+	muted?: boolean | Signal<boolean>;
+	volume?: number | Signal<number>;
 	captions?: CaptionsProps;
 	speaking?: SpeakingProps;
 
@@ -66,8 +68,7 @@ export class Audio {
 	speaking: Speaking;
 	maxLatency: DOMHighResTimeStamp;
 
-	media: Signal<AudioTrack | undefined>;
-	constraints: Signal<AudioConstraints | undefined>;
+	source: Signal<Source | undefined>;
 
 	#catalog = new Signal<Catalog.Audio | undefined>(undefined);
 	readonly catalog: Getter<Catalog.Audio | undefined> = this.#catalog;
@@ -81,20 +82,17 @@ export class Audio {
 	readonly root: Getter<AudioNode | undefined> = this.#gain;
 
 	#track = new Moq.TrackProducer("audio", 1);
-	#group?: Moq.GroupProducer;
-	#groupTimestamp = 0;
 
 	#signals = new Effect();
 
 	constructor(broadcast: Moq.BroadcastProducer, props?: AudioProps) {
 		this.broadcast = broadcast;
-		this.media = new Signal(props?.media);
-		this.enabled = new Signal(props?.enabled ?? false);
+		this.source = Signal.from(props?.source);
+		this.enabled = Signal.from(props?.enabled ?? false);
 		this.speaking = new Speaking(this, props?.speaking);
 		this.captions = new Captions(this, props?.captions);
-		this.constraints = new Signal(props?.constraints);
-		this.muted = new Signal(props?.muted ?? false);
-		this.volume = new Signal(props?.volume ?? 1);
+		this.muted = Signal.from(props?.muted ?? false);
+		this.volume = Signal.from(props?.volume ?? 1);
 		this.maxLatency = props?.maxLatency ?? 100; // Default is a group every 100ms
 
 		this.#signals.effect(this.#runSource.bind(this));
@@ -105,13 +103,12 @@ export class Audio {
 
 	#runSource(effect: Effect): void {
 		const enabled = effect.get(this.enabled);
-		const media = effect.get(this.media);
-		if (!enabled || !media) return;
+		if (!enabled) return;
 
-		const settings = media.getSettings();
-		if (!settings) {
-			throw new Error("track has no settings");
-		}
+		const source = effect.get(this.source);
+		if (!source) return;
+
+		const settings = source.getSettings();
 
 		const context = new AudioContext({
 			latencyHint: "interactive",
@@ -120,7 +117,7 @@ export class Audio {
 		effect.cleanup(() => context.close());
 
 		const root = new MediaStreamAudioSourceNode(context, {
-			mediaStream: new MediaStream([media]),
+			mediaStream: new MediaStream([source]),
 		});
 		effect.cleanup(() => root.disconnect());
 
@@ -167,18 +164,13 @@ export class Audio {
 	#runEncoder(effect: Effect): void {
 		if (!effect.get(this.enabled)) return;
 
-		const media = effect.get(this.media);
-		if (!media) return;
+		const source = effect.get(this.source);
+		if (!source) return;
 
 		const worklet = effect.get(this.#worklet);
 		if (!worklet) return;
 
-		this.broadcast.insertTrack(this.#track.consume());
-		effect.cleanup(() => {
-			this.broadcast.removeTrack(this.#track.name);
-		});
-
-		const settings = media.getSettings() as AudioTrackSettings;
+		const settings = source.getSettings() as AudioTrackSettings;
 
 		const config = {
 			// TODO get codec and description from decoderConfig
@@ -190,35 +182,31 @@ export class Audio {
 			bitrate: u53(settings.channelCount * 32_000),
 		};
 
+		let group: Moq.GroupProducer = this.#track.appendGroup();
+		effect.cleanup(() => group.close());
+
+		let groupTimestamp = 0;
+
 		const encoder = new AudioEncoder({
 			output: (frame) => {
 				if (frame.type !== "key") {
 					throw new Error("only key frames are supported");
 				}
 
-				if (!this.#group || frame.timestamp - this.#groupTimestamp >= 1000 * this.maxLatency) {
-					this.#group?.close();
-					this.#group = this.#track.appendGroup();
-					this.#groupTimestamp = frame.timestamp;
+				if (frame.timestamp - groupTimestamp >= 1000 * this.maxLatency) {
+					group.close();
+					group = this.#track.appendGroup();
+					groupTimestamp = frame.timestamp;
 				}
 
 				const buffer = Frame.encode(frame, frame.timestamp);
-				this.#group.writeFrame(buffer);
+				group.writeFrame(buffer);
 			},
 			error: (err) => {
-				this.#group?.abort(err);
-				this.#group = undefined;
-
-				this.#track.abort(err);
+				group.abort(err);
 			},
 		});
 		effect.cleanup(() => encoder.close());
-
-		effect.cleanup(() => {
-			this.#group?.close();
-			this.#group = undefined;
-			this.#groupTimestamp = 0;
-		});
 
 		encoder.configure({
 			codec: config.codec,
@@ -252,11 +240,18 @@ export class Audio {
 			encoder.encode(frame);
 			frame.close();
 		};
+		effect.cleanup(() => {
+			worklet.port.onmessage = null;
+		});
 	}
 
 	#runCatalog(effect: Effect): void {
 		const config = effect.get(this.#config);
 		if (!config) return;
+
+		// Insert the track into the broadcast before returning the catalog referencing it.
+		this.broadcast.insertTrack(this.#track.consume());
+		effect.cleanup(() => this.broadcast.removeTrack(this.#track.name));
 
 		const captions = effect.get(this.captions.catalog);
 		const speaking = effect.get(this.speaking.catalog);
@@ -277,6 +272,7 @@ export class Audio {
 	close() {
 		this.#signals.close();
 		this.captions.close();
+		this.speaking.close();
 		this.#track.close();
 	}
 }

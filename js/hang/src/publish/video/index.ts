@@ -10,13 +10,16 @@ import { VideoTrackProcessor } from "./polyfill";
 
 export * from "./detection";
 
+export type Source = VideoStreamTrack;
+
 // Create a group every 2 seconds
 const GOP_DURATION_US = 2 * 1000 * 1000;
 
 // Stronger typing for the MediaStreamTrack interface.
-export interface VideoTrack extends MediaStreamTrack {
+export interface VideoStreamTrack extends MediaStreamTrack {
 	kind: "video";
-	clone(): VideoTrack;
+	clone(): VideoStreamTrack;
+	getSettings(): VideoTrackSettings;
 }
 
 export interface VideoTrackSettings {
@@ -40,11 +43,10 @@ export type VideoConstraints = Omit<
 };
 
 export type VideoProps = {
-	enabled?: boolean;
-	media?: VideoTrack;
-	constraints?: VideoConstraints;
+	enabled?: boolean | Signal<boolean>;
+	source?: Source | Signal<Source | undefined>;
+	flip?: boolean | Signal<boolean>;
 	detection?: DetectionProps;
-	flip?: boolean;
 };
 
 export class Video {
@@ -53,14 +55,12 @@ export class Video {
 
 	enabled: Signal<boolean>;
 	flip: Signal<boolean>;
-
-	readonly media: Signal<VideoTrack | undefined>;
-	readonly constraints: Signal<VideoConstraints | undefined>;
+	source: Signal<Source | undefined>;
 
 	#catalog = new Signal<Catalog.Video | undefined>(undefined);
 	readonly catalog: Getter<Catalog.Video | undefined> = this.#catalog;
 
-	#track = new Signal<Moq.TrackProducer | undefined>(undefined);
+	#track = new Moq.TrackProducer("video", 1);
 
 	#active = new Signal(false);
 	readonly active: Getter<boolean> = this.#active;
@@ -69,7 +69,6 @@ export class Video {
 	#decoderConfig = new Signal<VideoDecoderConfig | undefined>(undefined);
 
 	#signals = new Effect();
-	#id = 0;
 
 	// Store the latest VideoFrame
 	frame = new Signal<VideoFrame | undefined>(undefined);
@@ -78,41 +77,27 @@ export class Video {
 		this.broadcast = broadcast;
 		this.detection = new Detection(this, props?.detection);
 
-		this.media = new Signal(props?.media);
-		this.enabled = new Signal(props?.enabled ?? false);
-		this.constraints = new Signal(props?.constraints);
-		this.flip = new Signal(props?.flip ?? false);
+		this.source = Signal.from(props?.source);
+		this.enabled = Signal.from(props?.enabled ?? false);
+		this.flip = Signal.from(props?.flip ?? false);
 
-		this.#signals.effect(this.#runTrack.bind(this));
 		this.#signals.effect(this.#runEncoder.bind(this));
 		this.#signals.effect(this.#runCatalog.bind(this));
 	}
 
-	#runTrack(effect: Effect): void {
-		const enabled = effect.get(this.enabled);
-		const media = effect.get(this.media);
-		if (!enabled || !media) return;
-
-		const track = new Moq.TrackProducer(`video-${this.#id++}`, 1);
-		effect.cleanup(() => track.close());
-
-		this.broadcast.insertTrack(track.consume());
-		effect.cleanup(() => this.broadcast.removeTrack(track.name));
-
-		effect.set(this.#track, track);
-	}
-
 	#runEncoder(effect: Effect): void {
-		if (!effect.get(this.enabled)) return;
+		const enabled = effect.get(this.enabled);
+		if (!enabled) return;
 
-		const media = effect.get(this.media);
-		if (!media) return;
+		const source = effect.get(this.source);
+		if (!source) return;
 
-		const track = effect.get(this.#track);
-		if (!track) return;
+		// Insert the track into the broadcast.
+		this.broadcast.insertTrack(this.#track.consume());
+		effect.cleanup(() => this.broadcast.removeTrack(this.#track.name));
 
-		const settings = media.getSettings() as VideoTrackSettings;
-		const processor = VideoTrackProcessor(media);
+		const settings = source.getSettings() as VideoTrackSettings;
+		const processor = VideoTrackProcessor(source);
 		const reader = processor.getReader();
 		effect.cleanup(() => reader.cancel());
 
@@ -130,7 +115,7 @@ export class Video {
 				if (frame.type === "key") {
 					groupTimestamp = frame.timestamp;
 					group?.close();
-					group = track.appendGroup();
+					group = this.#track.appendGroup();
 				} else if (!group) {
 					throw new Error("no keyframe");
 				}
@@ -140,7 +125,7 @@ export class Video {
 			},
 			error: (err: Error) => {
 				group?.abort(err);
-				track.abort(err);
+				this.#track.abort(err);
 			},
 		});
 		effect.cleanup(() => encoder.close());
@@ -353,9 +338,6 @@ export class Video {
 		const decoderConfig = effect.get(this.#decoderConfig);
 		if (!decoderConfig) return;
 
-		const track = effect.get(this.#track);
-		if (!track) return;
-
 		const flip = effect.get(this.flip);
 
 		const description = decoderConfig.description
@@ -364,8 +346,8 @@ export class Video {
 
 		const catalog: Catalog.Video = {
 			track: {
-				name: track.name,
-				priority: u8(track.priority),
+				name: this.#track.name,
+				priority: u8(this.#track.priority),
 			},
 			config: {
 				// The order is important here.
@@ -394,5 +376,6 @@ export class Video {
 
 		this.#signals.close();
 		this.detection.close();
+		this.#track.close();
 	}
 }

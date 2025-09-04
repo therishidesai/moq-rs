@@ -1,26 +1,19 @@
-use crate::{coding::*, message, Error};
+use std::sync::Arc;
 
-// A wrapper around a web_transport::SendStream that will reset on Drop
-pub(super) struct Writer {
-	stream: web_transport::SendStream,
+use crate::{coding::*, Error};
+
+// A wrapper around a SendStream that will reset on Drop
+pub(super) struct Writer<S: web_transport_trait::SendStream> {
+	stream: S,
 	buffer: bytes::BytesMut,
 }
 
-impl Writer {
-	pub fn new(stream: web_transport::SendStream) -> Self {
+impl<S: web_transport_trait::SendStream> Writer<S> {
+	pub fn new(stream: S) -> Self {
 		Self {
 			stream,
 			buffer: Default::default(),
 		}
-	}
-
-	pub async fn open(session: &mut web_transport::Session, typ: message::DataType) -> Result<Self, Error> {
-		let send = session.open_uni().await?;
-
-		let mut writer = Self::new(send);
-		writer.encode(&typ).await?;
-
-		Ok(writer)
 	}
 
 	pub async fn encode<T: Encode>(&mut self, msg: &T) -> Result<(), Error> {
@@ -28,25 +21,34 @@ impl Writer {
 		msg.encode(&mut self.buffer);
 
 		while !self.buffer.is_empty() {
-			self.stream.write_buf(&mut self.buffer).await?;
+			self.stream
+				.write_buf(&mut self.buffer)
+				.await
+				.map_err(|e| Error::Transport(Arc::new(e)))?;
 		}
 
 		Ok(())
 	}
 
-	pub async fn write(&mut self, buf: &[u8]) -> Result<(), Error> {
-		self.stream.write(buf).await?; // convert the error type
+	// Not public to avoid accidental partial writes.
+	async fn write<Buf: bytes::Buf + Send>(&mut self, buf: &mut Buf) -> Result<usize, Error> {
+		self.stream
+			.write_buf(buf)
+			.await
+			.map_err(|e| Error::Transport(Arc::new(e)))
+	}
+
+	// NOTE: We use Buf so we don't perform a copy when using Quinn.
+	pub async fn write_all<Buf: bytes::Buf + Send>(&mut self, buf: &mut Buf) -> Result<(), Error> {
+		while buf.has_remaining() {
+			self.write(buf).await?;
+		}
 		Ok(())
 	}
 
-	pub fn set_priority(&mut self, priority: i32) {
-		self.stream.set_priority(priority);
-	}
-
 	/// A clean termination of the stream, waiting for the peer to close.
-	pub async fn close(&mut self) -> Result<(), Error> {
-		self.stream.finish()?;
-		self.stream.closed().await?; // TODO Return any error code?
+	pub async fn finish(&mut self) -> Result<(), Error> {
+		self.stream.finish().await.map_err(|e| Error::Transport(Arc::new(e)))?;
 		Ok(())
 	}
 
@@ -55,12 +57,12 @@ impl Writer {
 	}
 
 	pub async fn closed(&mut self) -> Result<(), Error> {
-		self.stream.closed().await?;
+		self.stream.closed().await.map_err(|e| Error::Transport(Arc::new(e)))?;
 		Ok(())
 	}
 }
 
-impl Drop for Writer {
+impl<S: web_transport_trait::SendStream> Drop for Writer<S> {
 	fn drop(&mut self) {
 		// Unlike the Quinn default, we abort the stream on drop.
 		self.stream.reset(Error::Cancel.to_code());

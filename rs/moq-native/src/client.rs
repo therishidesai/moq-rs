@@ -6,8 +6,6 @@ use std::path::PathBuf;
 use std::{fs, io, net, sync::Arc, time};
 use url::Url;
 
-use web_transport::quinn as web_transport_quinn;
-
 #[derive(Clone, Default, Debug, clap::Args, serde::Serialize, serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ClientTls {
@@ -112,12 +110,11 @@ impl Client {
 
 		let socket = std::net::UdpSocket::bind(config.bind).context("failed to bind UDP socket")?;
 
-		// Enable BBR congestion control
-		// TODO validate the implementation
+		// TODO Validate the BBR implementation before enabling it
 		let mut transport = quinn::TransportConfig::default();
 		transport.max_idle_timeout(Some(time::Duration::from_secs(10).try_into().unwrap()));
 		transport.keep_alive_interval(Some(time::Duration::from_secs(4)));
-		transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
+		//transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
 		transport.mtu_discovery_config(None); // Disable MTU discovery
 		let transport = Arc::new(transport);
 
@@ -170,7 +167,7 @@ impl Client {
 		}
 
 		let alpn = match url.scheme() {
-			"https" => web_transport::quinn::ALPN,
+			"https" => web_transport_quinn::ALPN,
 			"moql" => moq_lite::ALPN,
 			_ => anyhow::bail!("url scheme must be 'http', 'https', or 'moql'"),
 		};
@@ -189,8 +186,8 @@ impl Client {
 		tracing::Span::current().record("id", connection.stable_id());
 
 		let session = match url.scheme() {
-			"https" => web_transport::quinn::Session::connect(connection, url).await?,
-			moq_lite::ALPN => web_transport::quinn::Session::raw(connection, url),
+			"https" => web_transport_quinn::Session::connect(connection, url).await?,
+			moq_lite::ALPN => web_transport_quinn::Session::raw(connection, url),
 			_ => unreachable!(),
 		};
 

@@ -9,26 +9,24 @@ use crate::{
 };
 
 use tokio::sync::oneshot;
-use web_async::{spawn, Lock};
+use web_async::Lock;
 
 use super::{Reader, Stream};
 
 #[derive(Clone)]
-pub(super) struct Subscriber {
-	session: web_transport::Session,
+pub(super) struct Subscriber<S: web_transport_trait::Session> {
+	session: S,
 
 	origin: Option<OriginProducer>,
-	broadcasts: Lock<HashMap<PathOwned, BroadcastProducer>>,
 	subscribes: Lock<HashMap<u64, TrackProducer>>,
 	next_id: Arc<atomic::AtomicU64>,
 }
 
-impl Subscriber {
-	pub fn new(session: web_transport::Session, origin: Option<OriginProducer>) -> Self {
+impl<S: web_transport_trait::Session> Subscriber<S> {
+	pub fn new(session: S, origin: Option<OriginProducer>) -> Self {
 		Self {
 			session,
 			origin,
-			broadcasts: Default::default(),
 			subscribes: Default::default(),
 			next_id: Default::default(),
 		}
@@ -42,18 +40,26 @@ impl Subscriber {
 		}
 	}
 
-	async fn run_uni(mut self) -> Result<(), Error> {
+	async fn run_uni(self) -> Result<(), Error> {
 		loop {
-			let stream = Reader::accept(&mut self.session).await?;
+			let stream = self
+				.session
+				.accept_uni()
+				.await
+				.map_err(|err| Error::Transport(Arc::new(err)))?;
+
+			let stream = Reader::new(stream);
 			let this = self.clone();
 
 			web_async::spawn(async move {
-				this.run_uni_stream(stream).await.ok();
+				if let Err(err) = this.run_uni_stream(stream).await {
+					tracing::debug!(%err, "error running uni stream");
+				}
 			});
 		}
 	}
 
-	async fn run_uni_stream(mut self, mut stream: Reader) -> Result<(), Error> {
+	async fn run_uni_stream(mut self, mut stream: Reader<S::RecvStream>) -> Result<(), Error> {
 		let kind = stream.decode().await?;
 
 		let res = match kind {
@@ -74,7 +80,7 @@ impl Subscriber {
 			return Ok(());
 		}
 
-		let mut stream = Stream::open(&mut self.session, message::ControlType::Announce).await?;
+		let mut stream = Stream::open(&self.session, message::ControlType::Announce).await?;
 
 		tracing::trace!(root = %self.log_path(""), "announced start");
 
@@ -108,7 +114,7 @@ impl Subscriber {
 		}
 
 		// Close the stream when there's nothing more to announce.
-		stream.writer.close().await
+		stream.writer.finish().await
 	}
 
 	fn start_announce(
@@ -132,7 +138,7 @@ impl Subscriber {
 			.unwrap()
 			.publish_broadcast(path.clone(), broadcast.consumer);
 
-		spawn(self.clone().run_broadcast(path, broadcast.producer));
+		web_async::spawn(self.clone().run_broadcast(path, broadcast.producer));
 
 		Ok(())
 	}
@@ -155,14 +161,11 @@ impl Subscriber {
 			let mut this = self.clone();
 
 			let path = path.clone();
-			spawn(async move {
+			web_async::spawn(async move {
 				this.run_subscribe(id, path, track).await;
 				this.subscribes.lock().remove(&id);
 			});
 		}
-
-		// Remove the broadcast from the lookup.
-		self.broadcasts.lock().remove(&path);
 	}
 
 	async fn run_subscribe(&mut self, id: u64, broadcast: Path<'_>, track: TrackProducer) {
@@ -183,7 +186,7 @@ impl Subscriber {
 		};
 
 		match res {
-			Err(Error::Cancel) | Err(Error::WebTransport(_)) => {
+			Err(Error::Cancel) | Err(Error::Transport(_)) => {
 				tracing::debug!(broadcast = %self.log_path(&broadcast), track = %track.info.name, id, "subscribe cancelled");
 				track.abort(Error::Cancel);
 			}
@@ -199,17 +202,17 @@ impl Subscriber {
 	}
 
 	async fn run_track(&mut self, msg: message::Subscribe<'_>) -> Result<(), Error> {
-		let mut stream = Stream::open(&mut self.session, message::ControlType::Subscribe).await?;
+		let mut stream = Stream::open(&self.session, message::ControlType::Subscribe).await?;
 
 		if let Err(err) = self.run_track_stream(&mut stream, msg).await {
 			stream.writer.abort(&err);
 			return Err(err);
 		}
 
-		stream.writer.close().await
+		stream.writer.finish().await
 	}
 
-	async fn run_track_stream(&mut self, stream: &mut Stream, msg: message::Subscribe<'_>) -> Result<(), Error> {
+	async fn run_track_stream(&mut self, stream: &mut Stream<S>, msg: message::Subscribe<'_>) -> Result<(), Error> {
 		stream.writer.encode(&msg).await?;
 
 		// TODO use the response correctly populate the track info
@@ -221,7 +224,7 @@ impl Subscriber {
 		Ok(())
 	}
 
-	pub async fn recv_group(&mut self, stream: &mut Reader) -> Result<(), Error> {
+	pub async fn recv_group(&mut self, stream: &mut Reader<S::RecvStream>) -> Result<(), Error> {
 		let group: message::Group = stream.decode().await?;
 
 		let group = {
@@ -240,7 +243,7 @@ impl Subscriber {
 		};
 
 		match res {
-			Err(Error::Cancel) | Err(Error::WebTransport(_)) => {
+			Err(Error::Cancel) | Err(Error::Transport(_)) => {
 				tracing::trace!(group = %group.info.sequence, "group cancelled");
 				group.abort(Error::Cancel);
 			}
@@ -257,7 +260,7 @@ impl Subscriber {
 		Ok(())
 	}
 
-	async fn run_group(&mut self, stream: &mut Reader, mut group: GroupProducer) -> Result<(), Error> {
+	async fn run_group(&mut self, stream: &mut Reader<S::RecvStream>, mut group: GroupProducer) -> Result<(), Error> {
 		while let Some(size) = stream.decode_maybe::<u64>().await? {
 			let frame = group.create_frame(Frame { size });
 
@@ -277,14 +280,18 @@ impl Subscriber {
 		Ok(())
 	}
 
-	async fn run_frame(&mut self, stream: &mut Reader, mut frame: FrameProducer) -> Result<(), Error> {
+	async fn run_frame(&mut self, stream: &mut Reader<S::RecvStream>, mut frame: FrameProducer) -> Result<(), Error> {
 		let mut remain = frame.info.size;
+
+		tracing::trace!(size = %frame.info.size, "reading frame");
 
 		while remain > 0 {
 			let chunk = stream.read(remain as usize).await?.ok_or(Error::WrongSize)?;
 			remain = remain.checked_sub(chunk.len() as u64).ok_or(Error::WrongSize)?;
 			frame.write_chunk(chunk);
 		}
+
+		tracing::trace!(size = %frame.info.size, "read frame");
 
 		frame.close();
 

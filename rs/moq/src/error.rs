@@ -1,10 +1,12 @@
+use std::sync::Arc;
+
 use crate::{coding, message};
 
 /// A list of possible errors that can occur during the session.
 #[derive(thiserror::Error, Debug, Clone)]
 pub enum Error {
-	#[error("webtransport error: {0}")]
-	WebTransport(#[from] web_transport::Error),
+	#[error("transport error: {0}")]
+	Transport(Arc<dyn std::error::Error + Send + Sync>),
 
 	#[error("decode error: {0}")]
 	Decode(#[from] coding::DecodeError),
@@ -67,7 +69,7 @@ impl Error {
 			Self::RequiredExtension(_) => 1,
 			Self::Old => 2,
 			Self::Timeout => 3,
-			Self::WebTransport(_) => 4,
+			Self::Transport(_) => 4,
 			Self::Decode(_) => 5,
 			Self::Unauthorized => 6,
 			Self::Version(..) => 9,

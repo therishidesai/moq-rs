@@ -21,6 +21,7 @@ mod session;
 
 pub mod coding;
 pub mod message;
+
 pub use error::*;
 pub use model::*;
 pub use path::*;
@@ -28,6 +29,3 @@ pub use session::*;
 
 /// The ALPN used when connecting via QUIC directly.
 pub const ALPN: &str = message::Alpn::CURRENT.0;
-
-/// Export the web_transport crate.
-pub use web_transport;

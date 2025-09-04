@@ -1,82 +1,207 @@
+use futures::{SinkExt, StreamExt};
 use std::{
 	net,
+	path::PathBuf,
 	pin::Pin,
+	sync::{
+		atomic::{AtomicU64, Ordering},
+		Arc,
+	},
 	task::{ready, Context, Poll},
 };
+use web_transport_ws::tungstenite;
 
 use axum::{
 	body::Body,
-	extract::Path,
+	extract::{Path, Query, State, WebSocketUpgrade},
 	http::{Method, StatusCode},
 	response::{IntoResponse, Response},
-	routing::get,
+	routing::{any, get},
 	Router,
 };
 use bytes::Bytes;
-use hyper_serve::accept::DefaultAcceptor;
+use clap::Parser;
+use moq_lite::{OriginConsumer, OriginProducer};
+use serde::{Deserialize, Serialize};
 use std::future::Future;
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::Cluster;
+use crate::{Auth, Cluster};
 
+#[derive(Debug, Deserialize)]
+struct Params {
+	jwt: Option<String>,
+}
+
+#[derive(Parser, Clone, Debug, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields, default)]
 pub struct WebConfig {
-	pub bind: net::SocketAddr,
-	pub fingerprints: Vec<String>,
+	#[command(flatten)]
+	#[serde(default)]
+	pub http: HttpConfig,
+
+	#[command(flatten)]
+	#[serde(default)]
+	pub https: HttpsConfig,
+
+	// If true (default), expose a WebTransport compatible WebSocket polyfill.
+	#[arg(long = "web-ws", env = "MOQ_WEB_WS", default_value = "true")]
+	#[serde(default = "default_true")]
+	pub ws: bool,
+}
+
+#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpConfig {
+	#[arg(long = "web-http-listen", id = "http-listen", env = "MOQ_WEB_HTTP_LISTEN")]
+	pub listen: Option<net::SocketAddr>,
+}
+
+#[derive(clap::Args, Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HttpsConfig {
+	#[arg(long = "web-https-listen", id = "web-https-listen", env = "MOQ_WEB_HTTPS_LISTEN", requires_all = ["web-https-cert", "web-https-key"])]
+	pub listen: Option<net::SocketAddr>,
+
+	/// Load the given certificate from disk.
+	#[arg(long = "web-https-cert", id = "web-https-cert", env = "MOQ_WEB_HTTPS_CERT")]
+	pub cert: Option<PathBuf>,
+
+	/// Load the given key from disk.
+	#[arg(long = "web-https-key", id = "web-https-key", env = "MOQ_WEB_HTTPS_KEY")]
+	pub key: Option<PathBuf>,
+}
+
+pub struct WebState {
+	pub auth: Auth,
 	pub cluster: Cluster,
+	pub fingerprints: Vec<String>,
+	pub conn_id: AtomicU64,
 }
 
 // Run a HTTP server using Axum
-// TODO remove this when Chrome adds support for self-signed certificates using WebTransport
 pub struct Web {
-	app: Router,
-	server: hyper_serve::Server<DefaultAcceptor>,
+	state: WebState,
+	config: WebConfig,
 }
 
 impl Web {
-	pub fn new(config: WebConfig) -> Self {
-		// Get the first certificate's fingerprint.
-		// TODO serve all of them so we can support multiple signature algorithms.
-		let fingerprint = config.fingerprints.first().expect("missing certificate").clone();
-
-		let app = Router::new()
-			.route("/certificate.sha256", get(fingerprint))
-			.route(
-				"/announced",
-				get({
-					let cluster = config.cluster.clone();
-					move || serve_announced(Path("".to_string()), cluster.clone())
-				}),
-			)
-			.route(
-				"/announced/{*prefix}",
-				get({
-					let cluster = config.cluster.clone();
-					move |path| serve_announced(path, cluster)
-				}),
-			)
-			.route(
-				"/fetch/{*path}",
-				get({
-					let cluster = config.cluster.clone();
-					move |path| serve_fetch(path, cluster)
-				}),
-			)
-			.layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]));
-
-		let server = hyper_serve::bind(config.bind);
-
-		Self { app, server }
+	pub fn new(state: WebState, config: WebConfig) -> Self {
+		Self { state, config }
 	}
 
 	pub async fn run(self) -> anyhow::Result<()> {
-		self.server.serve(self.app.into_make_service()).await?;
+		// Get the first certificate's fingerprint.
+		// TODO serve all of them so we can support multiple signature algorithms.
+		let fingerprint = self.state.fingerprints.first().expect("missing certificate").clone();
+
+		let app = Router::new()
+			.route("/certificate.sha256", get(fingerprint))
+			.route("/announced", get(serve_announced))
+			.route("/announced/{*prefix}", get(serve_announced))
+			.route("/fetch/{*path}", get(serve_fetch));
+
+		// If WebSocket is enabled, add the WebSocket route.
+		let app = match self.config.ws {
+			true => app.route("/{*path}", any(serve_ws)),
+			false => app,
+		}
+		.layer(CorsLayer::new().allow_origin(Any).allow_methods([Method::GET]))
+		.with_state(Arc::new(self.state))
+		.into_make_service();
+
+		let http = if let Some(listen) = self.config.http.listen {
+			let server = hyper_serve::bind(listen);
+			Some(server.serve(app.clone()))
+		} else {
+			None
+		};
+
+		let https = if let Some(listen) = self.config.https.listen {
+			let cert = self.config.https.cert.as_ref().expect("missing certificate");
+			let key = self.config.https.key.as_ref().expect("missing key");
+
+			let config = hyper_serve::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?;
+
+			let server = hyper_serve::bind_rustls(listen, config);
+			Some(server.serve(app))
+		} else {
+			None
+		};
+
+		tokio::select! {
+			Some(res) = async move { Some(http?.await) } => res?,
+			Some(res) = async move { Some(https?.await) } => res?,
+			else => {},
+		};
+
 		Ok(())
 	}
 }
 
+async fn serve_ws(
+	ws: WebSocketUpgrade,
+	Path(path): Path<String>,
+	Query(params): Query<Params>,
+	State(state): State<Arc<WebState>>,
+) -> axum::response::Result<Response> {
+	let ws = ws.protocols(["webtransport"]);
+
+	let token = state.auth.verify(&path, params.jwt.as_deref())?;
+	let publish = state.cluster.publisher(&token);
+	let subscribe = state.cluster.subscriber(&token);
+
+	if publish.is_none() && subscribe.is_none() {
+		// Bad token, we can't publish or subscribe.
+		return Err(StatusCode::UNAUTHORIZED.into());
+	}
+
+	Ok(ws.on_upgrade(async move |socket| {
+		let id = state.conn_id.fetch_add(1, Ordering::Relaxed);
+
+		// Unfortunately, we need to convert from Axum to Tungstenite.
+		// Axum uses Tungstenite internally, but it's not exposed to avoid semvar issues.
+		let socket = socket
+			.map(axum_to_tungstenite)
+			// TODO Figure out how to avoid swallowing errors.
+			.sink_map_err(|err| {
+				tracing::warn!(%err, "WebSocket error");
+				tungstenite::Error::ConnectionClosed
+			})
+			.with(tungstenite_to_axum);
+		let _ = handle_socket(id, socket, publish, subscribe).await;
+	}))
+}
+
+#[tracing::instrument("ws", err, skip_all, fields(id = _id))]
+async fn handle_socket<T>(
+	_id: u64,
+	socket: T,
+	publish: Option<OriginProducer>,
+	subscribe: Option<OriginConsumer>,
+) -> anyhow::Result<()>
+where
+	T: futures::Stream<Item = Result<tungstenite::Message, tungstenite::Error>>
+		+ futures::Sink<tungstenite::Message, Error = tungstenite::Error>
+		+ Send
+		+ Unpin
+		+ 'static,
+{
+	// Wrap the WebSocket in a WebTransport compatibility layer.
+	let ws = web_transport_ws::Session::new(socket, true);
+	let session = moq_lite::Session::accept(ws, subscribe, publish).await?;
+	Err(session.closed().await.into())
+}
+
 /// Serve the announced broadcasts for a given prefix.
-async fn serve_announced(Path(prefix): Path<String>, cluster: Cluster) -> axum::response::Result<String> {
-	let mut origin = match cluster.combined.consumer.consume_only(&[prefix.into()]) {
+async fn serve_announced(
+	Path(prefix): Path<Option<String>>,
+	Query(params): Query<Params>,
+	State(state): State<Arc<WebState>>,
+) -> axum::response::Result<String> {
+	let prefix = prefix.unwrap_or_default();
+	let token = state.auth.verify(&prefix, params.jwt.as_deref())?;
+	let mut origin = match state.cluster.subscriber(&token) {
 		Some(origin) => origin,
 		None => return Err(StatusCode::UNAUTHORIZED.into()),
 	};
@@ -93,14 +218,27 @@ async fn serve_announced(Path(prefix): Path<String>, cluster: Cluster) -> axum::
 }
 
 /// Serve the latest group for a given track
-async fn serve_fetch(Path(path): Path<String>, cluster: Cluster) -> axum::response::Result<ServeGroup> {
+async fn serve_fetch(
+	Path(path): Path<String>,
+	Query(params): Query<Params>,
+	State(state): State<Arc<WebState>>,
+) -> axum::response::Result<ServeGroup> {
+	// The path containts a broadcast/track
 	let mut path: Vec<&str> = path.split("/").collect();
-	if path.len() < 2 {
+	let track = path.pop().unwrap().to_string();
+
+	// We need at least a broadcast and a track.
+	if path.is_empty() {
 		return Err(StatusCode::BAD_REQUEST.into());
 	}
 
-	let track = path.pop().unwrap().to_string();
 	let broadcast = path.join("/");
+	let token = state.auth.verify(&broadcast, params.jwt.as_deref())?;
+
+	let origin = match state.cluster.subscriber(&token) {
+		Some(origin) => origin,
+		None => return Err(StatusCode::UNAUTHORIZED.into()),
+	};
 
 	tracing::info!(%broadcast, %track, "subscribing to track");
 
@@ -109,7 +247,7 @@ async fn serve_fetch(Path(path): Path<String>, cluster: Cluster) -> axum::respon
 		priority: 0,
 	};
 
-	let broadcast = cluster.get(&broadcast).ok_or(StatusCode::NOT_FOUND)?;
+	let broadcast = origin.consume_broadcast(&broadcast).ok_or(StatusCode::NOT_FOUND)?;
 	let mut track = broadcast.subscribe_track(&track);
 
 	let group = match track.next_group().await {
@@ -186,4 +324,52 @@ impl IntoResponse for ServeGroupError {
 	fn into_response(self) -> Response {
 		(StatusCode::INTERNAL_SERVER_ERROR, self.0.to_string()).into_response()
 	}
+}
+
+// https://github.com/tokio-rs/axum/discussions/848#discussioncomment-11443587
+
+#[allow(clippy::result_large_err)]
+fn axum_to_tungstenite(
+	message: Result<axum::extract::ws::Message, axum::Error>,
+) -> Result<tungstenite::Message, tungstenite::Error> {
+	match message {
+		Ok(msg) => Ok(match msg {
+			axum::extract::ws::Message::Text(text) => tungstenite::Message::Text(text.to_string()),
+			axum::extract::ws::Message::Binary(bin) => tungstenite::Message::Binary(bin.into()),
+			axum::extract::ws::Message::Ping(ping) => tungstenite::Message::Ping(ping.into()),
+			axum::extract::ws::Message::Pong(pong) => tungstenite::Message::Pong(pong.into()),
+			axum::extract::ws::Message::Close(close) => {
+				tungstenite::Message::Close(close.map(|c| tungstenite::protocol::CloseFrame {
+					code: c.code.into(),
+					reason: c.reason.to_string().into(),
+				}))
+			}
+		}),
+		Err(_err) => Err(tungstenite::Error::ConnectionClosed),
+	}
+}
+
+#[allow(clippy::result_large_err)]
+fn tungstenite_to_axum(
+	message: tungstenite::Message,
+) -> Pin<Box<dyn Future<Output = Result<axum::extract::ws::Message, tungstenite::Error>> + Send + Sync>> {
+	Box::pin(async move {
+		Ok(match message {
+			tungstenite::Message::Text(text) => axum::extract::ws::Message::Text(text.into()),
+			tungstenite::Message::Binary(bin) => axum::extract::ws::Message::Binary(bin.into()),
+			tungstenite::Message::Ping(ping) => axum::extract::ws::Message::Ping(ping.into()),
+			tungstenite::Message::Pong(pong) => axum::extract::ws::Message::Pong(pong.into()),
+			tungstenite::Message::Frame(_frame) => unreachable!(),
+			tungstenite::Message::Close(close) => {
+				axum::extract::ws::Message::Close(close.map(|c| axum::extract::ws::CloseFrame {
+					code: c.code.into(),
+					reason: c.reason.to_string().into(),
+				}))
+			}
+		})
+	})
+}
+
+fn default_true() -> bool {
+	true
 }

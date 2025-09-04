@@ -5,7 +5,7 @@ export type Partial = "full" | "partial" | "none";
 
 export type Audio = {
 	aac: boolean;
-	opus: boolean;
+	opus: Partial;
 };
 
 export type Codec = {
@@ -22,7 +22,7 @@ export type Video = {
 };
 
 export type Full = {
-	webtransport: boolean;
+	webtransport: Partial;
 	audio: {
 		capture: boolean;
 		encoding: Audio | undefined;
@@ -115,21 +115,21 @@ async function videoEncoderSupported(codec: keyof typeof CODECS) {
 
 export async function isSupported(): Promise<Full> {
 	return {
-		webtransport: typeof WebTransport !== "undefined",
+		webtransport: typeof WebTransport !== "undefined" ? "full" : "partial",
 		audio: {
 			capture: typeof AudioWorkletNode !== "undefined",
 			encoding:
 				typeof AudioEncoder !== "undefined"
 					? {
 							aac: await audioEncoderSupported("aac"),
-							opus: await audioEncoderSupported("opus"),
+							opus: (await audioEncoderSupported("opus")) ? "full" : "partial",
 						}
 					: undefined,
 			decoding:
 				typeof AudioDecoder !== "undefined"
 					? {
 							aac: await audioDecoderSupported("aac"),
-							opus: await audioDecoderSupported("opus"),
+							opus: (await audioDecoderSupported("opus")) ? "full" : "partial",
 						}
 					: undefined,
 			render: typeof AudioContext !== "undefined" && typeof AudioBufferSourceNode !== "undefined",

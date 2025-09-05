@@ -1,7 +1,7 @@
 {
 	"name": "@kixelated/hang",
 	"type": "module",
-	"version": "0.4.1",
+	"version": "0.4.2",
 	"description": "Media over QUIC library",
 	"license": "(MIT OR Apache-2.0)",
 	"repository": "github:kixelated/moq",
@@ -41,10 +41,10 @@
 		"@huggingface/transformers": "^3.7.2",
 		"@kixelated/moq": "workspace:^",
 		"@kixelated/signals": "workspace:^",
-		"@libav.js/variant-opus": "^6.8.8",
+		"@libav.js/variant-opus-af": "^6.8.8",
 		"async-mutex": "^0.5.0",
 		"comlink": "^4.4.2",
-		"libavjs-webcodecs-polyfill": "^0.5.5",
+		"@kixelated/libavjs-webcodecs-polyfill": "^0.5.5",
 		"zod": "^4.1.5"
 	},
 	"devDependencies": {

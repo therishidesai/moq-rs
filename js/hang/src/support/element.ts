@@ -117,8 +117,7 @@ export default class HangSupport extends HTMLElement {
 	}
 
 	#getSummary(support: Full, mode: SupportMode): "full" | "partial" | "none" {
-		const core = this.#getCoreSupport(support);
-
+		const core = support.webtransport;
 		if (core === "none" || mode === "core") return core;
 
 		if (mode === "watch") {
@@ -135,11 +134,6 @@ export default class HangSupport extends HTMLElement {
 		if (watch === "none" || publish === "none") return "none";
 		if (watch === "partial" && publish === "partial") return "partial";
 
-		return "full";
-	}
-
-	#getCoreSupport(support: Full): "full" | "none" {
-		if (!support.webtransport) return "none";
 		return "full";
 	}
 
@@ -246,7 +240,7 @@ export default class HangSupport extends HTMLElement {
 		const hardware = (codec: Codec | undefined) =>
 			codec?.hardware ? "🟢 Hardware" : codec?.software ? `🟡 Software${isFirefox ? "*" : ""}` : "🔴 No";
 		const partial = (value: Partial | undefined) =>
-			value === "full" ? "🟢 Full" : value === "partial" ? "🟡 Partial" : "🔴 None";
+			value === "full" ? "🟢 Full" : value === "partial" ? "🟡 Polyfill" : "🔴 None";
 
 		const addRow = (label: string, col2: string, col3: string) => {
 			const labelDiv = DOM.create(
@@ -291,8 +285,8 @@ export default class HangSupport extends HTMLElement {
 			if (mode !== "watch") {
 				addRow("Capture", "Audio", binary(support.audio.capture));
 				addRow("", "Video", partial(support.video.capture));
-				addRow("Encoding", "Opus", partial(support.audio.encoding?.opus));
-				addRow("", "AAC", binary(support.audio.encoding?.aac));
+				addRow("Encoding", "Opus", partial(support.audio.encoding.opus));
+				addRow("", "AAC", binary(support.audio.encoding.aac));
 				addRow("", "AV1", hardware(support.video.encoding?.av1));
 				addRow("", "H.265", hardware(support.video.encoding?.h265));
 				addRow("", "H.264", hardware(support.video.encoding?.h264));
@@ -302,8 +296,8 @@ export default class HangSupport extends HTMLElement {
 			if (mode !== "publish") {
 				addRow("Rendering", "Audio", binary(support.audio.render));
 				addRow("", "Video", binary(support.video.render));
-				addRow("Decoding", "Opus", partial(support.audio.decoding?.opus));
-				addRow("", "AAC", binary(support.audio.decoding?.aac));
+				addRow("Decoding", "Opus", partial(support.audio.decoding.opus));
+				addRow("", "AAC", binary(support.audio.decoding.aac));
 				addRow("", "AV1", hardware(support.video.decoding?.av1));
 				addRow("", "H.265", hardware(support.video.decoding?.h265));
 				addRow("", "H.264", hardware(support.video.decoding?.h264));

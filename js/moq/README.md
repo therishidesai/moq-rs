@@ -16,11 +16,12 @@ Check out [../hang] for a higher-level media library that uses this package.
 ## Quick Start
 
 ```bash
-npm install @kixelated/moq
+npm add @kixelated/moq
 # or
 pnpm add @kixelated/moq
-# or
+bun add @kixelated/moq
 yarn add @kixelated/moq
+# etc
 ```
 
 ### Basic Connection

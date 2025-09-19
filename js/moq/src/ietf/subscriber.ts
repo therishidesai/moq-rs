@@ -1,13 +1,13 @@
-import { type AnnouncedConsumer, AnnouncedProducer } from "../announced.ts";
-import { type BroadcastConsumer, BroadcastProducer } from "../broadcast.ts";
-import { GroupProducer } from "../group.ts";
-import * as Path from "../path.ts";
+import { Announced } from "../announced.ts";
+import { Broadcast, type TrackRequest } from "../broadcast.ts";
+import { Group } from "../group.ts";
+import * as Path from "../path.js";
 import type { Reader } from "../stream.ts";
-import type { TrackProducer } from "../track.ts";
+import type { Track } from "../track.ts";
 import { error } from "../util/error.ts";
 import type { Announce, Unannounce } from "./announce.ts";
 import type * as Control from "./control.ts";
-import { Frame, type Group } from "./object.ts";
+import { Frame, type Group as GroupMessage } from "./object.ts";
 import { Subscribe, type SubscribeDone, type SubscribeError, type SubscribeOk, Unsubscribe } from "./subscribe.ts";
 import type { SubscribeAnnouncesError, SubscribeAnnouncesOk } from "./subscribe_announces.ts";
 import type { TrackStatus } from "./track.ts";
@@ -19,10 +19,9 @@ import type { TrackStatus } from "./track.ts";
  */
 export class Subscriber {
 	#control: Control.Stream;
-	#root: Path.Valid;
 
 	// Our subscribed tracks - keyed by subscription ID
-	#subscribes = new Map<bigint, TrackProducer>();
+	#subscribes = new Map<bigint, Track>();
 	#subscribeNext = 0n;
 
 	// Track subscription responses - keyed by subscription ID
@@ -34,8 +33,6 @@ export class Subscriber {
 		}
 	>();
 
-	#announced: AnnouncedProducer;
-
 	/**
 	 * Creates a new Subscriber instance.
 	 * @param quic - The WebTransport session to use
@@ -43,77 +40,56 @@ export class Subscriber {
 	 *
 	 * @internal
 	 */
-	constructor(control: Control.Stream, root: Path.Valid) {
+	constructor(control: Control.Stream) {
 		this.#control = control;
-		this.#root = root;
-		this.#announced = new AnnouncedProducer();
 		//void this.#runAnnounced();
 	}
-
-	/* TODO once the remote server actually supports it
-	async #runAnnounced() {
-		// Send me everything at the root.
-		const msg = new SubscribeAnnounces(this.#root);
-		await Control.write(this.#control, msg);
-	}
-	*/
 
 	/**
 	 * Gets an announced reader for the specified prefix.
 	 * @param prefix - The prefix for announcements
 	 * @returns An AnnounceConsumer instance
 	 */
-	announced(prefix: Path.Valid = Path.empty()): AnnouncedConsumer {
-		const full = Path.join(this.#root, prefix);
-		return this.#announced.consume(full);
+	announced(_prefix = Path.empty()): Announced {
+		const announced = new Announced();
+		return announced;
+
+		/* TODO once the remote server actually supports it
+		async #runAnnounced() {
+			// Send me everything at the root.
+			const msg = new SubscribeAnnounces(this.#root);
+			await Control.write(this.#control, msg);
+		}
+		*/
 	}
 
 	/**
 	 * Consumes a broadcast from the connection.
 	 *
-	 * NOTE: This is not automatically deduplicated.
-	 * If to consume the same broadcast twice, and subscribe to the same tracks twice, then network usage is doubled.
-	 * However, you can call `clone()` on the consumer to deduplicate and share the same handle.
-	 *
 	 * @param name - The name of the broadcast to consume
-	 * @returns A BroadcastConsumer instance
+	 * @returns A Broadcast instance
 	 */
-	consume(broadcast: Path.Valid): BroadcastConsumer {
-		const producer = new BroadcastProducer();
-		const consumer = producer.consume();
+	consume(path: Path.Valid): Broadcast {
+		const broadcast = new Broadcast();
 
-		producer.unknownTrack((track) => {
-			// Save the track in the cache to deduplicate.
-			// NOTE: We don't clone it (yet) so it doesn't count as an active consumer.
-			// When we do clone it, we'll only get the most recent (consumed) group.
-			producer.insertTrack(track.consume());
+		(async () => {
+			for (;;) {
+				const request = await broadcast.requested();
+				if (!request) break;
+				this.#runSubscribe(path, request);
+			}
+		})();
 
-			// Perform the subscription in the background.
-			this.#runSubscribe(broadcast, track).finally(() => {
-				try {
-					producer.removeTrack(track.name);
-				} catch {
-					// Already closed.
-					console.warn("track already removed");
-				}
-			});
-		});
-
-		// Close when the producer has no more consumers.
-		producer.unused().finally(() => {
-			producer.close();
-		});
-
-		return consumer;
+		return broadcast;
 	}
 
-	async #runSubscribe(broadcast: Path.Valid, track: TrackProducer) {
+	async #runSubscribe(broadcast: Path.Valid, request: TrackRequest) {
 		const subscribeId = this.#subscribeNext++;
 
 		// Save the writer so we can append groups to it.
-		this.#subscribes.set(subscribeId, track);
+		this.#subscribes.set(subscribeId, request.track);
 
-		const msg = new Subscribe(subscribeId, subscribeId, broadcast, track.name, track.priority);
+		const msg = new Subscribe(subscribeId, subscribeId, broadcast, request.track.name, request.priority);
 
 		// Send SUBSCRIBE message on control stream and wait for response
 		const responsePromise = new Promise<SubscribeOk>((resolve, reject) => {
@@ -124,15 +100,13 @@ export class Subscriber {
 
 		try {
 			await responsePromise;
-			await track.unused();
-
-			track.close();
+			await request.track.closed;
 
 			const msg = new Unsubscribe(subscribeId);
 			await this.#control.write(msg);
 		} catch (err) {
 			const e = error(err);
-			track.abort(e);
+			request.track.close(e);
 		} finally {
 			this.#subscribes.delete(subscribeId);
 			this.#subscribeCallbacks.delete(subscribeId);
@@ -172,8 +146,8 @@ export class Subscriber {
 	 *
 	 * @internal
 	 */
-	async handleGroup(group: Group, stream: Reader) {
-		const producer = new GroupProducer(group.groupId);
+	async handleGroup(group: GroupMessage, stream: Reader) {
+		const producer = new Group(group.groupId);
 
 		try {
 			const track = this.#subscribes.get(group.trackAlias);
@@ -182,11 +156,11 @@ export class Subscriber {
 			}
 
 			// Convert to Group (moq-lite equivalent)
-			track.insertGroup(producer.consume());
+			track.writeGroup(producer);
 
 			// Read objects from the stream until end of group
 			for (;;) {
-				const done = await Promise.race([stream.done(), track.unused(), producer.unused()]);
+				const done = await Promise.race([stream.done(), producer.closed, track.closed]);
 				if (done !== false) break;
 
 				const frame = await Frame.decode(stream);
@@ -199,7 +173,7 @@ export class Subscriber {
 			producer.close();
 		} catch (err: unknown) {
 			const e = error(err);
-			producer.abort(e);
+			producer.close(e);
 			stream.stop(e);
 		}
 	}
@@ -220,22 +194,16 @@ export class Subscriber {
 	 * Handles an ANNOUNCE control message received on the control stream.
 	 * @param msg - The ANNOUNCE message
 	 */
-	async handleAnnounce(msg: Announce) {
-		this.#announced.write({
-			name: msg.trackNamespace,
-			active: true,
-		});
+	async handleAnnounce(_msg: Announce) {
+		// TODO implement once Cloudflare supports it
 	}
 
 	/**
 	 * Handles an UNANNOUNCE control message received on the control stream.
 	 * @param msg - The UNANNOUNCE message
 	 */
-	async handleUnannounce(msg: Unannounce) {
-		this.#announced.write({
-			name: msg.trackNamespace,
-			active: false,
-		});
+	async handleUnannounce(_msg: Unannounce) {
+		// TODO implement once Cloudflare supports it
 	}
 
 	async handleSubscribeAnnouncesOk(_msg: SubscribeAnnouncesOk) {

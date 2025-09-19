@@ -1,7 +1,6 @@
 import * as Moq from "@kixelated/moq";
 import { Effect, Signal } from "@kixelated/signals";
 import * as DOM from "@kixelated/signals/dom";
-import { Connection } from "../connection";
 import { Broadcast } from "./broadcast";
 import * as Source from "./source";
 
@@ -43,7 +42,7 @@ export default class HangPublish extends HTMLElement {
 	}
 
 	disconnectedCallback() {
-		this.active.set((prev) => {
+		this.active.update((prev) => {
 			prev?.close();
 			return undefined;
 		});
@@ -144,7 +143,7 @@ export default class HangPublish extends HTMLElement {
 
 class HangPublishInstance {
 	parent: HangPublish;
-	connection: Connection;
+	connection: Moq.Connection.Reload;
 	broadcast: Broadcast;
 
 	#preview: Signal<HTMLVideoElement | undefined>;
@@ -164,10 +163,13 @@ class HangPublishInstance {
 		observer.observe(this.parent, { childList: true, subtree: true });
 		this.#signals.cleanup(() => observer.disconnect());
 
-		this.connection = new Connection({
+		this.connection = new Moq.Connection.Reload({
+			enabled: true,
 			url: this.parent.signals.url,
 		});
-		this.broadcast = new Broadcast(this.connection, {
+
+		this.broadcast = new Broadcast({
+			connection: this.connection.established,
 			enabled: true, // TODO allow configuring this
 			name: this.parent.signals.name,
 
@@ -426,7 +428,7 @@ class HangPublishInstance {
 			});
 
 			const caret = DOM.create("span", { style: { fontSize: "0.75em", cursor: "pointer" } }, "▼");
-			effect.event(caret, "click", () => visible.set((v) => !v));
+			effect.event(caret, "click", () => visible.update((v) => !v));
 
 			effect.effect((effect) => {
 				const v = effect.get(visible);
@@ -513,7 +515,7 @@ class HangPublishInstance {
 			});
 
 			const caret = DOM.create("span", { style: { fontSize: "0.75em", cursor: "pointer" } }, "▼");
-			effect.event(caret, "click", () => visible.set((v) => !v));
+			effect.event(caret, "click", () => visible.update((v) => !v));
 
 			effect.effect((effect) => {
 				const v = effect.get(visible);
@@ -578,8 +580,8 @@ class HangPublishInstance {
 		const container = DOM.create("div");
 
 		effect.effect((effect) => {
-			const url = effect.get(this.broadcast.connection.url);
-			const status = effect.get(this.broadcast.connection.status);
+			const url = effect.get(this.connection.url);
+			const status = effect.get(this.connection.status);
 			const audio = effect.get(this.broadcast.audio.source);
 			const video = effect.get(this.broadcast.video.source);
 

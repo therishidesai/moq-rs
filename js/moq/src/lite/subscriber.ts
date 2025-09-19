@@ -1,12 +1,12 @@
-import { type AnnouncedConsumer, AnnouncedProducer } from "../announced.ts";
-import { type BroadcastConsumer, BroadcastProducer } from "../broadcast.ts";
-import { GroupProducer } from "../group.ts";
+import { Announced } from "../announced.ts";
+import { Broadcast, type TrackRequest } from "../broadcast.ts";
+import { Group } from "../group.ts";
 import * as Path from "../path.ts";
 import { type Reader, Stream } from "../stream.ts";
-import type { TrackProducer } from "../track.ts";
+import type { Track } from "../track.ts";
 import { error } from "../util/error.ts";
 import { Announce, AnnounceInit, AnnounceInterest } from "./announce.ts";
-import type { Group } from "./group.ts";
+import type { Group as GroupMessage } from "./group.ts";
 import { StreamId } from "./stream.ts";
 import { Subscribe, SubscribeOk } from "./subscribe.ts";
 
@@ -19,7 +19,7 @@ export class Subscriber {
 	#quic: WebTransport;
 
 	// Our subscribed tracks.
-	#subscribes = new Map<bigint, TrackProducer>();
+	#subscribes = new Map<bigint, Track>();
 	#subscribeNext = 0n;
 
 	/**
@@ -33,94 +33,80 @@ export class Subscriber {
 	}
 
 	/**
-	 * Gets an announced reader for the specified prefix.
-	 * @param prefix - The prefix for announcements
-	 * @returns An AnnounceConsumer instance
 	 */
-	announced(prefix: Path.Valid = Path.empty()): AnnouncedConsumer {
-		console.debug(`announce please: prefix=${prefix}`);
+	announced(prefix = Path.empty()): Announced {
+		const announced = new Announced();
+		void this.#runAnnounced(announced, prefix);
+		return announced;
+	}
 
-		const producer = new AnnouncedProducer();
-		const consumer = producer.consume(prefix);
-
+	async #runAnnounced(announced: Announced, prefix: Path.Valid): Promise<void> {
+		console.debug(`announced: prefix=${prefix}`);
 		const msg = new AnnounceInterest(prefix);
 
-		(async () => {
-			try {
-				// Open a stream and send the announce interest.
-				const stream = await Stream.open(this.#quic);
-				await stream.writer.u8(StreamId.Announce);
-				await msg.encode(stream.writer);
+		try {
+			// Open a stream and send the announce interest.
+			const stream = await Stream.open(this.#quic);
+			await stream.writer.u8(StreamId.Announce);
+			await msg.encode(stream.writer);
 
-				// First, receive ANNOUNCE_INIT
-				const init = await AnnounceInit.decode(stream.reader);
+			// First, receive ANNOUNCE_INIT
+			const init = await AnnounceInit.decode(stream.reader);
 
-				// Process initial announcements
-				for (const suffix of init.suffixes) {
-					const name = Path.join(prefix, suffix);
-					console.debug(`announced: broadcast=${name} active=true`);
-					producer.write({ name, active: true });
-				}
-
-				// Then receive updates
-				for (;;) {
-					const announce = await Announce.decodeMaybe(stream.reader);
-					if (!announce) {
-						break;
-					}
-
-					const name = Path.join(prefix, announce.suffix);
-
-					console.debug(`announced: broadcast=${name} active=${announce.active}`);
-					producer.write({ name, active: announce.active });
-				}
-
-				producer.close();
-			} catch (err: unknown) {
-				producer.abort(error(err));
+			// Process initial announcements
+			for (const suffix of init.suffixes) {
+				const name = Path.join(prefix, suffix);
+				console.debug(`announced: broadcast=${name} active=true`);
+				announced.append({ name, active: true });
 			}
-		})();
 
-		return consumer;
+			// Then receive updates
+			for (;;) {
+				const announce = await Promise.race([Announce.decodeMaybe(stream.reader), announced.closed]);
+				if (!announce) break;
+				if (announce instanceof Error) throw announce;
+
+				const name = Path.join(prefix, announce.suffix);
+
+				console.debug(`announced: broadcast=${name} active=${announce.active}`);
+				announced.append({ name, active: announce.active });
+			}
+
+			announced.close();
+		} catch (err: unknown) {
+			announced.close(error(err));
+		}
 	}
 
 	/**
 	 * Consumes a broadcast from the connection.
 	 *
-	 * NOTE: This is not automatically deduplicated.
-	 * If to consume the same broadcast twice, and subscribe to the same tracks twice, then network usage is doubled.
-	 * However, you can call `clone()` on the consumer to deduplicate and share the same handle.
-	 *
 	 * @param name - The name of the broadcast to consume
-	 * @returns A BroadcastConsumer instance
+	 * @returns A Broadcast instance
 	 */
-	consume(broadcast: Path.Valid): BroadcastConsumer {
-		const producer = new BroadcastProducer();
-		const consumer = producer.consume();
+	consume(path: Path.Valid): Broadcast {
+		const broadcast = new Broadcast();
 
-		producer.unknownTrack((track) => {
-			// NOTE: We intentionally don't deduplicate because BUGS.
-			// Perform the subscription in the background.
-			this.#runSubscribe(broadcast, track);
-		});
+		(async () => {
+			for (;;) {
+				const request = await broadcast.requested();
+				if (!request) break;
+				this.#runSubscribe(path, request);
+			}
+		})();
 
-		// Close when the producer has no more consumers.
-		producer.unused().finally(() => {
-			producer.close();
-		});
-
-		return consumer;
+		return broadcast;
 	}
 
-	async #runSubscribe(broadcast: Path.Valid, track: TrackProducer) {
+	async #runSubscribe(broadcast: Path.Valid, request: TrackRequest) {
 		const id = this.#subscribeNext++;
 
 		// Save the writer so we can append groups to it.
-		this.#subscribes.set(id, track);
+		this.#subscribes.set(id, request.track);
 
-		console.debug(`subscribe start: id=${id} broadcast=${broadcast} track=${track.name}`);
+		console.debug(`subscribe start: id=${id} broadcast=${broadcast} track=${request.track.name}`);
 
-		const msg = new Subscribe(id, broadcast, track.name, track.priority);
+		const msg = new Subscribe(id, broadcast, request.track.name, request.priority);
 
 		const stream = await Stream.open(this.#quic);
 		await stream.writer.u8(StreamId.Subscribe);
@@ -128,19 +114,22 @@ export class Subscriber {
 
 		try {
 			await SubscribeOk.decode(stream.reader);
-			console.debug(`subscribe ok: id=${id} broadcast=${broadcast} track=${track.name}`);
+			console.debug(`subscribe ok: id=${id} broadcast=${broadcast} track=${request.track.name}`);
 
-			await Promise.race([stream.reader.closed(), track.unused()]);
+			await Promise.race([stream.reader.closed, request.track.closed]);
 
-			track.close();
-			console.debug(`subscribe close: id=${id} broadcast=${broadcast} track=${track.name}`);
+			request.track.close();
+			stream.close();
+			console.debug(`subscribe close: id=${id} broadcast=${broadcast} track=${request.track.name}`);
 		} catch (err) {
 			const e = error(err);
-			track.abort(e);
-			console.warn(`subscribe error: id=${id} broadcast=${broadcast} track=${track.name} error=${e.message}`);
+			request.track.close(e);
+			console.warn(
+				`subscribe error: id=${id} broadcast=${broadcast} track=${request.track.name} error=${e.message}`,
+			);
+			stream.abort(e);
 		} finally {
 			this.#subscribes.delete(id);
-			stream.close();
 		}
 	}
 
@@ -151,7 +140,7 @@ export class Subscriber {
 	 *
 	 * @internal
 	 */
-	async runGroup(group: Group, stream: Reader) {
+	async runGroup(group: GroupMessage, stream: Reader) {
 		const subscribe = this.#subscribes.get(group.subscribe);
 		if (!subscribe) {
 			if (group.subscribe >= this.#subscribeNext) {
@@ -161,12 +150,12 @@ export class Subscriber {
 			return;
 		}
 
-		const producer = new GroupProducer(group.sequence);
-		subscribe.insertGroup(producer.consume());
+		const producer = new Group(group.sequence);
+		subscribe.writeGroup(producer);
 
 		try {
 			for (;;) {
-				const done = await Promise.race([stream.done(), subscribe.unused(), producer.unused()]);
+				const done = await Promise.race([stream.done(), subscribe.closed, producer.closed]);
 				if (done !== false) break;
 
 				const size = await stream.u53();
@@ -177,8 +166,11 @@ export class Subscriber {
 			}
 
 			producer.close();
+			stream.stop(new Error("cancel"));
 		} catch (err: unknown) {
-			producer.abort(error(err));
+			const e = error(err);
+			producer.close(e);
+			stream.stop(e);
 		}
 	}
 

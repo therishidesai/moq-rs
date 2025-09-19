@@ -1,7 +1,6 @@
 import * as Moq from "@kixelated/moq";
 import { Effect, Signal } from "@kixelated/signals";
 import * as DOM from "@kixelated/signals/dom";
-import { Connection } from "../connection";
 import * as Audio from "./audio";
 import { Broadcast } from "./broadcast";
 import * as Video from "./video";
@@ -63,7 +62,7 @@ export default class HangWatch extends HTMLElement {
 	}
 
 	disconnectedCallback() {
-		this.active.set((prev) => {
+		this.active.update((prev) => {
 			prev?.close();
 			return undefined;
 		});
@@ -170,7 +169,7 @@ class HangWatchInstance {
 
 	// You can construct these manually if you want to use the library without the web component.
 	// However be warned that the API is still in flux and may change.
-	connection: Connection;
+	connection: Moq.Connection.Reload;
 	broadcast: Broadcast;
 	video: Video.Renderer;
 	audio: Audio.Emitter;
@@ -178,11 +177,13 @@ class HangWatchInstance {
 
 	constructor(parent: HangWatch) {
 		this.parent = parent;
-		this.connection = new Connection({
+		this.connection = new Moq.Connection.Reload({
 			url: this.parent.signals.url,
+			enabled: true,
 		});
 
-		this.broadcast = new Broadcast(this.connection, {
+		this.broadcast = new Broadcast({
+			connection: this.connection.established,
 			name: this.parent.signals.name,
 			enabled: true,
 			reload: this.parent.signals.reload,
@@ -349,7 +350,7 @@ class HangWatchInstance {
 
 		effect.event(button, "click", (e) => {
 			e.preventDefault();
-			this.video.paused.set((prev) => !prev);
+			this.video.paused.update((prev) => !prev);
 		});
 
 		effect.effect((effect) => {
@@ -375,7 +376,7 @@ class HangWatchInstance {
 		});
 
 		effect.event(muteButton, "click", () => {
-			this.audio.muted.set((p) => !p);
+			this.audio.muted.update((p) => !p);
 		});
 
 		const volumeSlider = DOM.create("input", {
@@ -417,8 +418,8 @@ class HangWatchInstance {
 		const container = DOM.create("div");
 
 		effect.effect((effect) => {
-			const url = effect.get(this.broadcast.connection.url);
-			const connection = effect.get(this.broadcast.connection.status);
+			const url = effect.get(this.connection.url);
+			const connection = effect.get(this.connection.status);
 			const broadcast = effect.get(this.broadcast.status);
 
 			if (!url) {

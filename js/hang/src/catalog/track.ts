@@ -1,9 +1,13 @@
 import { z } from "zod";
-import { u8Schema } from "./integers";
 
-export const TrackSchema = z.object({
-	name: z.string(),
-	priority: u8Schema,
-});
-
+export const TrackSchema = z.union([
+	z.string(),
+	// TODO remove backwards compatibility
+	z
+		.object({
+			name: z.string(),
+			priority: z.number().int().min(0).max(255),
+		})
+		.transform((val) => val.name),
+]);
 export type Track = z.infer<typeof TrackSchema>;

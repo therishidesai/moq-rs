@@ -1,12 +1,12 @@
-import { AnnouncedProducer } from "../announced.ts";
-import type { BroadcastConsumer } from "../broadcast.ts";
-import type { GroupConsumer } from "../group.ts";
+import { type Dispose, Signal } from "@kixelated/signals";
+import type { Broadcast } from "../broadcast.ts";
+import type { Group } from "../group.ts";
 import * as Path from "../path.ts";
 import { type Stream, Writer } from "../stream.ts";
-import type { TrackConsumer } from "../track.ts";
+import type { Track } from "../track.ts";
 import { error } from "../util/error.ts";
 import { Announce, AnnounceInit, type AnnounceInterest } from "./announce.ts";
-import { Group } from "./group.ts";
+import { Group as GroupMessage } from "./group.ts";
 import { type Subscribe, SubscribeOk, SubscribeUpdate } from "./subscribe.ts";
 
 /**
@@ -17,12 +17,9 @@ import { type Subscribe, SubscribeOk, SubscribeUpdate } from "./subscribe.ts";
 export class Publisher {
 	#quic: WebTransport;
 
-	// TODO this will store every announce/unannounce message, which will grow unbounded.
-	// We should remove any cached announcements on unannounce, etc.
-	#announced = new AnnouncedProducer();
-
 	// Our published broadcasts.
-	#broadcasts = new Map<Path.Valid, BroadcastConsumer>();
+	// It's a signal so we can live update any announce streams.
+	#broadcasts = new Signal<Map<Path.Valid, Broadcast> | undefined>(new Map());
 
 	/**
 	 * Creates a new Publisher instance.
@@ -38,29 +35,18 @@ export class Publisher {
 	 * Publishes a broadcast with any associated tracks.
 	 * @param name - The broadcast to publish
 	 */
-	publish(name: Path.Valid, broadcast: BroadcastConsumer) {
-		this.#broadcasts.set(name, broadcast);
-		void this.#runPublish(name, broadcast);
-	}
+	publish(name: Path.Valid, broadcast: Broadcast) {
+		this.#broadcasts.mutate((broadcasts) => {
+			if (!broadcasts) throw new Error("closed");
+			broadcasts.set(name, broadcast);
+		});
 
-	async #runPublish(name: Path.Valid, broadcast: BroadcastConsumer) {
-		try {
-			this.#announced.write({
-				name,
-				active: true,
+		// Remove the broadcast from the lookup when it's closed.
+		void broadcast.closed.finally(() => {
+			this.#broadcasts.mutate((broadcasts) => {
+				broadcasts?.delete(name);
 			});
-
-			// Wait until the broadcast is closed, then remove it from the lookup.
-			await broadcast.closed();
-		} finally {
-			broadcast.close();
-
-			this.#broadcasts.delete(name);
-			this.#announced.write({
-				name,
-				active: false,
-			});
-		}
+		});
 	}
 
 	/**
@@ -71,55 +57,65 @@ export class Publisher {
 	 * @internal
 	 */
 	async runAnnounce(msg: AnnounceInterest, stream: Stream) {
-		const consumer = this.#announced.consume(msg.prefix);
+		console.debug(`announce: prefix=${msg.prefix}`);
 
 		// Send ANNOUNCE_INIT as the first message with all currently active paths
-		const activePaths: Path.Valid[] = [];
+		let active = new Set<Path.Valid>();
 
-		// Make a resolved promise so we can avoid blocking.
-		// This abuses the fact that Promise.race will prioritize the first resolved promise.
-		const timeout = Promise.resolve();
+		const broadcasts = this.#broadcasts.peek();
+		if (!broadcasts) return; // closed
 
-		let next = consumer.next();
-
-		for (;;) {
-			const announcement = await Promise.race([next, timeout]);
-			if (!announcement) break;
-
-			console.debug(`announce: broadcast=${announcement.name} active=${announcement.active} init=true`);
-
-			const suffix = Path.stripPrefix(msg.prefix, announcement.name);
-			if (suffix === null) throw new Error("invalid suffix");
-
-			const index = activePaths.indexOf(suffix);
-			if (announcement.active) {
-				if (index !== -1) throw new Error("duplicate announce");
-				activePaths.push(suffix);
-			} else {
-				if (index === -1) throw new Error("unknown announce");
-				activePaths.splice(index, 1);
-			}
-
-			next = consumer.next();
+		for (const name of broadcasts.keys()) {
+			const suffix = Path.stripPrefix(msg.prefix, name);
+			if (suffix === null) continue;
+			console.debug(`announce: broadcast=${name} active=true`);
+			active.add(suffix);
 		}
 
-		const init = new AnnounceInit(activePaths);
+		const init = new AnnounceInit(active.values().toArray());
 		await init.encode(stream.writer);
 
-		// Then send updates as they occur
+		// Wait for updates to the broadcasts.
 		for (;;) {
-			const announcement = await next;
-			if (!announcement) break;
+			// TODO Make a better helper within Signals.
+			let dispose!: Dispose;
+			const changed = new Promise<Map<Path.Valid, Broadcast> | undefined>((resolve) => {
+				dispose = this.#broadcasts.changed(resolve);
+			});
 
-			console.debug(`announce: broadcast=${announcement.name} active=${announcement.active} init=false`);
+			// Wait until the map of broadcasts changes.
+			const broadcasts = await Promise.race([changed, stream.reader.closed]);
+			dispose();
+			if (!broadcasts) break;
 
-			const wire = new Announce(announcement.name, announcement.active);
-			await wire.encode(stream.writer);
+			// Create a new set of active broadcasts.
+			// This is SLOW, but it's not worth optimizing because we often have just 1 broadcast anyway.
+			const newActive = new Set<Path.Valid>();
+			for (const name of broadcasts.keys()) {
+				const suffix = Path.stripPrefix(msg.prefix, name);
+				if (suffix === null) continue; // Not our prefix.
+				newActive.add(suffix);
+			}
 
-			next = consumer.next();
+			// Announce any new broadcasts.
+			for (const added of newActive.difference(active)) {
+				console.debug(`announce: broadcast=${added} active=true`);
+				const wire = new Announce(added, true);
+				await wire.encode(stream.writer);
+			}
+
+			// Announce any removed broadcasts.
+			for (const removed of active.difference(newActive)) {
+				console.debug(`announce: broadcast=${removed} active=false`);
+				const wire = new Announce(removed, false);
+				await wire.encode(stream.writer);
+			}
+
+			// NOTE: This is kind of a hack that won't work with a rapid UNANNOUNCE/ANNOUNCE cycle.
+			// However, our client doesn't do that anyway.
+
+			active = newActive;
 		}
-
-		consumer.close();
 	}
 
 	/**
@@ -130,7 +126,7 @@ export class Publisher {
 	 * @internal
 	 */
 	async runSubscribe(msg: Subscribe, stream: Stream) {
-		const broadcast = this.#broadcasts.get(msg.broadcast);
+		const broadcast = this.#broadcasts.peek()?.get(msg.broadcast);
 		if (!broadcast) {
 			console.debug(`publish unknown: broadcast=${msg.broadcast}`);
 			stream.writer.reset(new Error("not found"));
@@ -138,8 +134,9 @@ export class Publisher {
 		}
 
 		const track = broadcast.subscribe(msg.track, msg.priority);
+
 		try {
-			const info = new SubscribeOk(track.priority);
+			const info = new SubscribeOk(msg.priority);
 			await info.encode(stream.writer);
 
 			console.debug(`publish ok: broadcast=${msg.broadcast} track=${track.name}`);
@@ -159,8 +156,13 @@ export class Publisher {
 			}
 
 			console.debug(`publish done: broadcast=${msg.broadcast} track=${track.name}`);
-		} finally {
+			stream.close();
 			track.close();
+		} catch (err: unknown) {
+			const e = error(err);
+			console.warn(`publish error: broadcast=${msg.broadcast} track=${track.name} error=${e.message}`);
+			track.close(e);
+			stream.abort(e);
 		}
 	}
 
@@ -173,11 +175,11 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runTrack(sub: bigint, broadcast: Path.Valid, track: TrackConsumer, stream: Writer) {
+	async #runTrack(sub: bigint, broadcast: Path.Valid, track: Track, stream: Writer) {
 		try {
 			for (;;) {
 				const next = track.nextGroup();
-				const group = await Promise.race([next, stream.closed()]);
+				const group = await Promise.race([next, stream.closed]);
 				if (!group) {
 					next.then((group) => group?.close()).catch(() => {});
 					break;
@@ -187,13 +189,13 @@ export class Publisher {
 			}
 
 			console.debug(`publish close: broadcast=${broadcast} track=${track.name}`);
+			track.close();
 			stream.close();
 		} catch (err: unknown) {
 			const e = error(err);
 			console.warn(`publish error: broadcast=${broadcast} track=${track.name} error=${e.message}`);
+			track.close(e);
 			stream.reset(e);
-		} finally {
-			track.close();
 		}
 	}
 
@@ -204,8 +206,8 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runGroup(sub: bigint, group: GroupConsumer) {
-		const msg = new Group(sub, group.sequence);
+	async #runGroup(sub: bigint, group: Group) {
+		const msg = new GroupMessage(sub, group.sequence);
 		try {
 			const stream = await Writer.open(this.#quic);
 			await stream.u8(0);
@@ -213,7 +215,7 @@ export class Publisher {
 
 			try {
 				for (;;) {
-					const frame = await Promise.race([group.readFrame(), stream.closed()]);
+					const frame = await Promise.race([group.readFrame(), stream.closed]);
 					if (!frame) break;
 
 					await stream.u53(frame.byteLength);
@@ -221,21 +223,24 @@ export class Publisher {
 				}
 
 				stream.close();
+				group.close();
 			} catch (err: unknown) {
-				stream.reset(error(err));
+				const e = error(err);
+				stream.reset(e);
+				group.close(e);
 			}
-		} finally {
-			group.close();
+		} catch (err: unknown) {
+			const e = error(err);
+			group.close(e);
 		}
 	}
 
 	close() {
-		this.#announced.close();
-
-		for (const broadcast of this.#broadcasts.values()) {
-			broadcast.close();
-		}
-
-		this.#broadcasts.clear();
+		this.#broadcasts.update((broadcasts) => {
+			for (const broadcast of broadcasts?.values() ?? []) {
+				broadcast.close();
+			}
+			return undefined;
+		});
 	}
 }

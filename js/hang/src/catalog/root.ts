@@ -6,6 +6,7 @@ import { CapabilitiesSchema } from "./capabilities";
 import { ChatSchema } from "./chat";
 import { DetectionSchema } from "./detection";
 import { LocationSchema } from "./location";
+import { TrackSchema } from "./track";
 import { UserSchema } from "./user";
 import { VideoSchema } from "./video";
 
@@ -17,6 +18,7 @@ export const RootSchema = z.object({
 	chat: ChatSchema.optional(),
 	detection: DetectionSchema.optional(),
 	capabilities: CapabilitiesSchema.optional(),
+	preview: TrackSchema.optional(),
 });
 
 export type Root = z.infer<typeof RootSchema>;
@@ -38,7 +40,7 @@ export function decode(raw: Uint8Array): Root {
 	}
 }
 
-export async function fetch(track: Moq.TrackConsumer): Promise<Root | undefined> {
+export async function fetch(track: Moq.Track): Promise<Root | undefined> {
 	const frame = await track.readFrame();
 	if (!frame) return undefined;
 	return decode(frame);

@@ -8,7 +8,13 @@ type Subscriber<T> = (value: T) => void;
 const DEV = typeof import.meta.env !== "undefined" && import.meta.env?.MODE !== "production";
 
 export interface Getter<T> {
+	// Get the current value.
 	peek(): T;
+
+	// Receive a notification once when the value changes.
+	changed(fn: Subscriber<T>): Dispose;
+
+	// Receive a notification each time the value changes.
 	subscribe(fn: Subscriber<T>): Dispose;
 }
 
@@ -18,7 +24,9 @@ export interface Setter<T> {
 
 export class Signal<T> implements Getter<T>, Setter<T> {
 	#value: T;
+
 	#subscribers: Set<Subscriber<T>> = new Set();
+	#changed: Set<Subscriber<T>> = new Set();
 
 	constructor(value: T) {
 		this.#value = value;
@@ -36,49 +44,103 @@ export class Signal<T> implements Getter<T>, Setter<T> {
 		return this.#value;
 	}
 
-	set(value: T | ((prev: T) => T)): void {
-		let newValue: T;
-		if (typeof value === "function") {
-			newValue = (value as (prev: T) => T)(this.#value);
-			// NOTE: We can't check for equality because the function could mutate the value.
-		} else {
-			// NOTE: This uses a more expensive dequal check to avoid spurious updates.
-			// Other libraries use === but it's a massive footgun unless you're using primatives.
-			if (dequal(value, this.#value)) {
+	// Set the current value, by default notifying subscribers if the value is different.
+	// If notify is undefined, we'll check if the value has changed after the microtask.
+	set(value: T, notify?: boolean): void {
+		const old = this.#value;
+		this.#value = value;
+
+		// If notify is false, don't notify.
+		if (notify === false) return;
+
+		// Don't even queue a microtask if the value is the EXACT same.
+		// We don't use dequal here because we don't want to run it twice, only when it matters.
+		if (notify === undefined && old === this.#value) return;
+
+		// If there are no subscribers, don't queue a microtask.
+		if (this.#subscribers.size === 0 && this.#changed.size === 0) return;
+
+		const subscribers = this.#subscribers;
+		const changed = this.#changed;
+		this.#changed = new Set();
+
+		queueMicrotask(() => {
+			// After the microtask, check if the value has changed if we didn't explicitly notify.
+			if (notify === undefined && dequal(old, this.#value)) {
+				// No change, add back the changed subscribers.
+				for (const fn of changed) {
+					this.#changed.add(fn);
+				}
 				return;
 			}
-			newValue = value;
-		}
 
-		this.#value = newValue;
+			for (const fn of subscribers) {
+				try {
+					fn(value);
+				} catch (error) {
+					console.error("signal subscriber error", error);
+				}
+			}
 
-		for (const subscriber of this.#subscribers) {
-			subscriber(newValue);
-		}
+			for (const fn of changed) {
+				try {
+					fn(value);
+				} catch (error) {
+					console.error("signal changed error", error);
+				}
+			}
+		});
 	}
 
-	// Mutate the current value and notify subscribers.
-	update(fn: (prev: T) => void): void {
-		fn(this.#value);
-		this.set(this.#value);
+	// Mutate the current value and notify subscribers unless notify is false.
+	// Unlike set, we can't use a dequal check because the function may mutate the value.
+	update(fn: (prev: T) => T, notify = true): void {
+		const value = fn(this.#value);
+		this.set(value, notify);
 	}
 
-	// Receive a notification when the value changes.
+	// Mutate the current value and notify subscribers unless notify is false.
+	mutate<R>(fn: (value: T) => R, notify = true): R {
+		const r = fn(this.#value);
+		this.set(this.#value, notify);
+		return r;
+	}
+
+	// Receive a notification each time the value changes.
 	subscribe(fn: Subscriber<T>): Dispose {
 		this.#subscribers.add(fn);
+		if (DEV && this.#subscribers.size >= 100 && Number.isInteger(Math.log10(this.#subscribers.size))) {
+			throw new Error("signal has too many subscribers; may be leaking");
+		}
 		return () => this.#subscribers.delete(fn);
 	}
 
-	// Receive a notification when the value changes AND with the current value.
+	// Receive a notification when the value changes.
+	changed(fn: (value: T) => void): Dispose {
+		this.#changed.add(fn);
+		return () => this.#changed.delete(fn);
+	}
+
+	// Receive a notification when the value changes AND with the initial value.
 	watch(fn: Subscriber<T>): Dispose {
 		const dispose = this.subscribe(fn);
-		try {
-			fn(this.#value);
-		} catch (e) {
-			dispose();
-			throw e;
-		}
+		queueMicrotask(() => fn(this.#value));
 		return dispose;
+	}
+
+	static async race<T extends readonly unknown[]>(
+		...sigs: { [K in keyof T]: Signal<T[K]> }
+	): Promise<Awaited<T[number]>> {
+		const dispose: Dispose[] = [];
+
+		const result: Awaited<T[number]> = await new Promise((resolve) => {
+			for (const sig of sigs) {
+				dispose.push(sig.changed(resolve));
+			}
+		});
+
+		for (const fn of dispose) fn();
+		return result;
 	}
 }
 
@@ -151,31 +213,6 @@ export class Effect {
 			this.#stop = resolve;
 		});
 
-		// Wait for all async effects to complete.
-		try {
-			let warn: ReturnType<typeof setTimeout> | undefined;
-			const timeout = new Promise<void>((resolve) => {
-				warn = setTimeout(() => {
-					if (DEV) {
-						console.warn("spawn is still running after 1s; continuing anyway", this.#stack);
-					}
-
-					resolve();
-				}, 1000);
-			});
-
-			await Promise.race([Promise.all(this.#async), timeout]);
-			if (warn) clearTimeout(warn);
-
-			this.#async.length = 0;
-		} catch (error) {
-			console.error("async effect error", error);
-			if (this.#stack) console.error("stack", this.#stack);
-		}
-
-		// We were closed while waiting for async effects to complete.
-		if (this.#dispose === undefined) return;
-
 		// Unsubscribe from all signals.
 		for (const unwatch of this.#unwatch) unwatch();
 		this.#unwatch.length = 0;
@@ -183,6 +220,33 @@ export class Effect {
 		// Run the cleanup functions for the previous run.
 		for (const fn of this.#dispose) fn();
 		this.#dispose.length = 0;
+
+		// Wait for all async effects to complete.
+		if (this.#async.length > 0) {
+			try {
+				let warn: ReturnType<typeof setTimeout> | undefined;
+				const timeout = new Promise<void>((resolve) => {
+					warn = setTimeout(() => {
+						if (DEV) {
+							console.warn("spawn is still running after 5s; continuing anyway", this.#stack);
+						}
+
+						resolve();
+					}, 5000);
+				});
+
+				await Promise.race([Promise.all(this.#async), timeout]);
+				if (warn) clearTimeout(warn);
+
+				this.#async.length = 0;
+			} catch (error) {
+				console.error("async effect error", error);
+				if (this.#stack) console.error("stack", this.#stack);
+			}
+		}
+
+		// We were closed while waiting for async effects to complete.
+		if (this.#dispose === undefined) return;
 
 		// IMPORTANT: must run all of the dispose functions before unscheduling.
 		// Otherwise, cleanup functions could get us stuck in an infinite loop.
@@ -203,9 +267,12 @@ export class Effect {
 		}
 
 		const value = signal.peek();
-		const dispose = signal.subscribe(() => this.#schedule());
 
+		// NOTE: We use changed instead of subscribe just so it's slightly more efficient.
+		// 1 clear() instead of N delete() calls.
+		const dispose = signal.changed(() => this.#schedule());
 		this.#unwatch.push(dispose);
+
 		return value;
 	}
 
@@ -230,12 +297,11 @@ export class Effect {
 		this.cleanup(() => signal.set(cleanupValue));
 	}
 
+	// Spawn an async effect that blocks the effect being reloaded until it completes.
+	// Use this.cancel if you need to detect when the effect is reloading to terminate.
 	// TODO: Add effect for another layer of nesting
-
-	// Spawn an async effect that blocks the effect being rerun until it completes.
-	// The cancel promise is resolved when the effect should cleanup: on close or rerun.
-	spawn(fn: (cancel: Promise<void>) => Promise<void>) {
-		const promise = fn(this.#stopped).catch((error) => {
+	spawn(fn: () => Promise<void>) {
+		const promise = fn().catch((error) => {
 			console.error("spawn error", error);
 		});
 
@@ -453,7 +519,11 @@ export class Effect {
 		}
 	}
 
-	async closed() {
-		await this.#closed;
+	get closed(): Promise<void> {
+		return this.#closed;
+	}
+
+	get cancel(): Promise<void> {
+		return this.#stopped;
 	}
 }

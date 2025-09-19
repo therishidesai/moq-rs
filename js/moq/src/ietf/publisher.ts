@@ -1,12 +1,12 @@
-import type { BroadcastConsumer } from "../broadcast.ts";
-import type { GroupConsumer } from "../group.ts";
-import * as Path from "../path.ts";
+import type { Broadcast } from "../broadcast.ts";
+import type { Group } from "../group.ts";
+import type * as Path from "../path.ts";
 import { Writer } from "../stream.ts";
-import type { TrackConsumer } from "../track.ts";
+import type { Track } from "../track.ts";
 import { error } from "../util/error.ts";
 import { Announce, type AnnounceCancel, type AnnounceError, type AnnounceOk, Unannounce } from "./announce.ts";
 import type * as Control from "./control.ts";
-import { Frame, Group, writeStreamType } from "./object.ts";
+import { Frame, Group as GroupMessage, writeStreamType } from "./object.ts";
 import { type Subscribe, SubscribeDone, SubscribeError, SubscribeOk, type Unsubscribe } from "./subscribe.ts";
 import type { SubscribeAnnounces, UnsubscribeAnnounces } from "./subscribe_announces.ts";
 import { TrackStatus, type TrackStatusRequest } from "./track.ts";
@@ -19,10 +19,9 @@ import { TrackStatus, type TrackStatusRequest } from "./track.ts";
 export class Publisher {
 	#quic: WebTransport;
 	#control: Control.Stream;
-	#root: Path.Valid;
 
 	// Our published broadcasts.
-	#broadcasts: Map<Path.Valid, BroadcastConsumer> = new Map();
+	#broadcasts: Map<Path.Valid, Broadcast> = new Map();
 
 	/**
 	 * Creates a new Publisher instance.
@@ -31,38 +30,36 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	constructor(quic: WebTransport, control: Control.Stream, root: Path.Valid) {
+	constructor(quic: WebTransport, control: Control.Stream) {
 		this.#quic = quic;
 		this.#control = control;
-		this.#root = root;
 	}
 
 	/**
 	 * Publishes a broadcast with any associated tracks.
 	 * @param name - The broadcast to publish
 	 */
-	publish(name: Path.Valid, broadcast: BroadcastConsumer) {
-		const full = Path.join(this.#root, name);
-		this.#broadcasts.set(full, broadcast);
-		void this.#runPublish(full, broadcast);
+	publish(name: Path.Valid, broadcast: Broadcast) {
+		this.#broadcasts.set(name, broadcast);
+		void this.#runPublish(name, broadcast);
 	}
 
-	async #runPublish(full: Path.Valid, broadcast: BroadcastConsumer) {
+	async #runPublish(name: Path.Valid, broadcast: Broadcast) {
 		try {
-			const announce = new Announce(full);
+			const announce = new Announce(name);
 			await this.#control.write(announce);
 
 			// Wait until the broadcast is closed, then remove it from the lookup.
-			await broadcast.closed();
+			await broadcast.closed;
 
-			const unannounce = new Unannounce(full);
+			const unannounce = new Unannounce(name);
 			await this.#control.write(unannounce);
 		} catch (err: unknown) {
 			const e = error(err);
-			console.warn(`announce failed: broadcast=${full} error=${e.message}`);
+			console.warn(`announce failed: broadcast=${name} error=${e.message}`);
 		} finally {
 			broadcast.close();
-			this.#broadcasts.delete(full);
+			this.#broadcasts.delete(name);
 		}
 	}
 
@@ -74,8 +71,8 @@ export class Publisher {
 	 */
 	async handleSubscribe(msg: Subscribe) {
 		// Convert track namespace/name to broadcast path (moq-lite compatibility)
-		const full = Path.join(this.#root, msg.trackNamespace);
-		const broadcast = this.#broadcasts.get(full);
+		const name = msg.trackNamespace;
+		const broadcast = this.#broadcasts.get(name);
 
 		if (!broadcast) {
 			const errorMsg = new SubscribeError(
@@ -107,16 +104,11 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runTrack(subscribeId: bigint, trackAlias: bigint, track: TrackConsumer) {
+	async #runTrack(subscribeId: bigint, trackAlias: bigint, track: Track) {
 		try {
 			for (;;) {
-				const next = track.nextGroup();
-				const group = await Promise.race([next]);
-				if (!group) {
-					next.then((group) => group?.close()).catch(() => {});
-					break;
-				}
-
+				const group = await track.nextGroup();
+				if (!group) break;
 				void this.#runGroup(subscribeId, trackAlias, group);
 			}
 
@@ -139,7 +131,7 @@ export class Publisher {
 	 *
 	 * @internal
 	 */
-	async #runGroup(subscribeId: bigint, trackAlias: bigint, group: GroupConsumer) {
+	async #runGroup(subscribeId: bigint, trackAlias: bigint, group: Group) {
 		try {
 			// Create a new unidirectional stream for this group
 			const stream = await Writer.open(this.#quic);
@@ -148,7 +140,7 @@ export class Publisher {
 			await writeStreamType(stream);
 
 			// Write STREAM_HEADER_SUBGROUP
-			const header = new Group(
+			const header = new GroupMessage(
 				subscribeId,
 				trackAlias,
 				group.sequence,
@@ -159,7 +151,7 @@ export class Publisher {
 			try {
 				let objectId = 0;
 				for (;;) {
-					const frame = await Promise.race([group.readFrame(), stream.closed()]);
+					const frame = await Promise.race([group.readFrame(), stream.closed]);
 					if (!frame) break;
 
 					// Write each frame as an object

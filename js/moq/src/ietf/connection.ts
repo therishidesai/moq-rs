@@ -1,14 +1,14 @@
-import type { AnnouncedConsumer } from "../announced.ts";
-import type { BroadcastConsumer } from "../broadcast.ts";
-import type { Connection as ConnectionInterface } from "../connection.ts";
-import * as Path from "../path.ts";
+import type { Announced } from "../announced.ts";
+import type { Broadcast } from "../broadcast.ts";
+import type { Established } from "../connection/established.ts";
+import * as Path from "../path.js";
 import { type Reader, Readers, type Stream } from "../stream.ts";
 import { unreachable } from "../util/index.ts";
 import { Announce, AnnounceCancel, AnnounceError, AnnounceOk, Unannounce } from "./announce.ts";
 import * as Control from "./control.ts";
 import { Fetch, FetchError, FetchOk } from "./fetch.ts";
 import { GoAway } from "./goaway.ts";
-import { Group, readStreamType } from "./object.ts";
+import { Group as GroupMessage, readStreamType } from "./object.ts";
 import { Publisher } from "./publisher.ts";
 import * as Setup from "./setup.ts";
 import { Subscribe, SubscribeDone, SubscribeError, SubscribeOk, Unsubscribe } from "./subscribe.ts";
@@ -26,7 +26,7 @@ import { TrackStatus, TrackStatusRequest } from "./track.ts";
  *
  * @public
  */
-export class Connection implements ConnectionInterface {
+export class Connection implements Established {
 	// The URL of the connection.
 	readonly url: URL;
 
@@ -54,12 +54,8 @@ export class Connection implements ConnectionInterface {
 		this.url = url;
 		this.#quic = quic;
 		this.#control = new Control.Stream(control);
-
-		// The root path of the connection, to emulate moq-lite.
-		const root = Path.from(url.pathname);
-
-		this.#publisher = new Publisher(this.#quic, this.#control, root);
-		this.#subscriber = new Subscriber(this.#control, root);
+		this.#publisher = new Publisher(this.#quic, this.#control);
+		this.#subscriber = new Subscriber(this.#control);
 
 		this.#run();
 	}
@@ -93,7 +89,7 @@ export class Connection implements ConnectionInterface {
 	 * @param name - The broadcast path to publish
 	 * @param broadcast - The broadcast to publish
 	 */
-	publish(name: Path.Valid, broadcast: BroadcastConsumer) {
+	publish(name: Path.Valid, broadcast: Broadcast) {
 		this.#publisher.publish(name, broadcast);
 	}
 
@@ -102,7 +98,7 @@ export class Connection implements ConnectionInterface {
 	 * @param prefix - The prefix for announcements
 	 * @returns An AnnounceConsumer instance
 	 */
-	announced(prefix = Path.empty()): AnnouncedConsumer {
+	announced(prefix = Path.empty()): Announced {
 		return this.#subscriber.announced(prefix);
 	}
 
@@ -113,9 +109,9 @@ export class Connection implements ConnectionInterface {
 	 * If the broadcast is not found, a "not found" error will be thrown when requesting any tracks.
 	 *
 	 * @param broadcast - The path of the broadcast to consume
-	 * @returns A BroadcastConsumer instance
+	 * @returns A Broadcast instance
 	 */
-	consume(broadcast: Path.Valid): BroadcastConsumer {
+	consume(broadcast: Path.Valid): Broadcast {
 		return this.#subscriber.consume(broadcast);
 	}
 
@@ -247,7 +243,7 @@ export class Connection implements ConnectionInterface {
 		try {
 			await readStreamType(stream);
 
-			const header = await Group.decode(stream);
+			const header = await GroupMessage.decode(stream);
 			await this.#subscriber.handleGroup(header, stream);
 		} catch (err) {
 			console.error("error processing object stream", err);
@@ -258,7 +254,7 @@ export class Connection implements ConnectionInterface {
 	 * Returns a promise that resolves when the connection is closed.
 	 * @returns A promise that resolves when closed
 	 */
-	async closed(): Promise<void> {
-		await this.#quic.closed;
+	get closed(): Promise<void> {
+		return this.#quic.closed.then(() => undefined);
 	}
 }

@@ -36,10 +36,10 @@ export function decode(buffer: Uint8Array): { data: Uint8Array; timestamp: Time.
 }
 
 export class Producer {
-	#track: Moq.TrackProducer;
-	#group?: Moq.GroupProducer;
+	#track: Moq.Track;
+	#group?: Moq.Group;
 
-	constructor(track: Moq.TrackProducer) {
+	constructor(track: Moq.Track) {
 		this.#track = track;
 	}
 
@@ -66,9 +66,9 @@ export interface ConsumerProps {
 }
 
 export class Consumer {
-	#track: Moq.TrackConsumer;
+	#track: Moq.Track;
 	#latency: Time.Micro;
-	#groups: Moq.GroupConsumer[] = [];
+	#groups: Moq.Group[] = [];
 	#active = 0; // the active group sequence number
 	#frames: Frame[] = [];
 	#prev?: Time.Micro;
@@ -78,16 +78,24 @@ export class Consumer {
 
 	#signals = new Effect();
 
-	constructor(track: Moq.TrackConsumer, props?: ConsumerProps) {
+	constructor(track: Moq.Track, props?: ConsumerProps) {
 		this.#track = track;
 		this.#latency = Time.Micro.fromMilli(props?.latency ?? Time.Milli.zero);
+
 		this.#signals.spawn(this.#run.bind(this));
+		this.#signals.cleanup(() => {
+			this.#track.close();
+			for (const group of this.#groups) {
+				group.close();
+			}
+			this.#groups.length = 0;
+		});
 	}
 
-	async #run(cancel: Promise<void>) {
+	async #run() {
 		// Start fetching groups in the background
 		for (;;) {
-			const group = await Promise.race([this.#track.nextGroup(), cancel]);
+			const group = await this.#track.nextGroup();
 			if (!group) break;
 
 			if (group.sequence < this.#active) {
@@ -99,7 +107,7 @@ export class Consumer {
 
 			// Insert into #groups based on the group sequence number (ascending).
 			// This is used to cancel old groups.
-			this.#groups.push(group.clone());
+			this.#groups.push(group);
 			this.#groups.sort((a, b) => a.sequence - b.sequence);
 
 			// Start buffering frames from this group
@@ -107,12 +115,12 @@ export class Consumer {
 		}
 	}
 
-	async #runGroup(group: Moq.GroupConsumer, cancel: Promise<void>) {
+	async #runGroup(group: Moq.Group) {
 		try {
 			let keyframe = true;
 
 			for (;;) {
-				const next = await Promise.race([group.readFrame(), cancel]);
+				const next = await group.readFrame();
 				if (!next) break;
 
 				const { data, timestamp } = decode(next);
@@ -130,9 +138,6 @@ export class Consumer {
 					// Already sorted; most of the time we just append to the end.
 					this.#frames.push(frame);
 				} else {
-					console.warn(
-						`frame out of order: ${frame.timestamp} < ${this.#frames[this.#frames.length - 1].timestamp}`,
-					);
 					this.#frames.push(frame);
 					this.#frames.sort((a, b) => a.timestamp - b.timestamp);
 				}
@@ -149,6 +154,8 @@ export class Consumer {
 			}
 
 			group.close();
+		} catch (_err) {
+			// Ignore errors, we close groups on purpose to skip them.
 		} finally {
 			if (group.sequence === this.#active) {
 				// Advance to the next group.
@@ -178,7 +185,6 @@ export class Consumer {
 		if (!nextFrame) return; // Within the same group, ignore for now
 
 		if (this.#prev) {
-			console.warn(`latency violation: ${Math.round(latency / 1000)}ms buffered`);
 			console.warn(`skipping ahead: ${Math.round((nextFrame.timestamp - this.#prev) / 1000)}ms`);
 		}
 
@@ -239,7 +245,7 @@ export class Consumer {
 				this.#notify = resolve;
 			}).then(() => true);
 
-			if (!(await Promise.race([wait, this.#signals.closed()]))) {
+			if (!(await Promise.race([wait, this.#signals.closed]))) {
 				this.#notify = undefined;
 				// Consumer was closed while waiting for a new frame.
 				return undefined;

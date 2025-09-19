@@ -1,7 +1,7 @@
-import type { AnnouncedConsumer } from "../announced.ts";
-import type { BroadcastConsumer } from "../broadcast.ts";
-import type { Connection as ConnectionInterface } from "../connection.ts";
-import * as Path from "../path.ts";
+import type { Announced } from "../announced.ts";
+import type { Broadcast } from "../broadcast.ts";
+import type { Established } from "../connection/established.ts";
+import * as Path from "../path.js";
 import { type Reader, Readers, Stream } from "../stream.ts";
 import { AnnounceInterest } from "./announce.ts";
 import { Group } from "./group.ts";
@@ -16,7 +16,7 @@ import { Subscriber } from "./subscriber.ts";
  *
  * @public
  */
-export class Connection implements ConnectionInterface {
+export class Connection implements Established {
 	// The URL of the connection.
 	readonly url: URL;
 
@@ -58,10 +58,18 @@ export class Connection implements ConnectionInterface {
 	 * Closes the connection.
 	 */
 	close() {
+		if (this.#closed) return;
+
 		this.#closed = true;
 		this.#publisher.close();
 		this.#subscriber.close();
-		this.#quic.close();
+
+		try {
+			// TODO: For whatever reason, this try/catch doesn't seem to work..?
+			this.#quic.close();
+		} catch {
+			// ignore
+		}
 	}
 
 	async #run(): Promise<void> {
@@ -85,16 +93,14 @@ export class Connection implements ConnectionInterface {
 	 * @param name - The broadcast path to publish
 	 * @param broadcast - The broadcast to publish
 	 */
-	publish(name: Path.Valid, broadcast: BroadcastConsumer) {
+	publish(name: Path.Valid, broadcast: Broadcast) {
 		this.#publisher.publish(name, broadcast);
 	}
 
 	/**
-	 * Gets an announced reader for the specified prefix.
-	 * @param prefix - The prefix for announcements
-	 * @returns An AnnounceConsumer instance
+	 * Gets the next announced broadcast.
 	 */
-	announced(prefix = Path.empty()): AnnouncedConsumer {
+	announced(prefix = Path.empty()): Announced {
 		return this.#subscriber.announced(prefix);
 	}
 
@@ -105,9 +111,9 @@ export class Connection implements ConnectionInterface {
 	 * If the broadcast is not found, a "not found" error will be thrown when requesting any tracks.
 	 *
 	 * @param broadcast - The path of the broadcast to consume
-	 * @returns A BroadcastConsumer instance
+	 * @returns A Broadcast instance
 	 */
-	consume(broadcast: Path.Valid): BroadcastConsumer {
+	consume(broadcast: Path.Valid): Broadcast {
 		return this.#subscriber.consume(broadcast);
 	}
 
@@ -192,7 +198,7 @@ export class Connection implements ConnectionInterface {
 	 * Returns a promise that resolves when the connection is closed.
 	 * @returns A promise that resolves when closed
 	 */
-	async closed(): Promise<void> {
-		await this.#quic.closed;
+	get closed(): Promise<void> {
+		return this.#quic.closed.then(() => undefined);
 	}
 }

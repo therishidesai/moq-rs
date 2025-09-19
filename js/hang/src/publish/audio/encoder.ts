@@ -1,7 +1,7 @@
 import * as Moq from "@kixelated/moq";
 import { Effect, type Getter, Signal } from "@kixelated/signals";
-import type * as Catalog from "../../catalog";
-import { u8, u53 } from "../../catalog/integers";
+import * as Catalog from "../../catalog";
+import { u53 } from "../../catalog/integers";
 import * as Frame from "../../frame";
 import * as Time from "../../time";
 import * as libav from "../../util/libav";
@@ -32,7 +32,7 @@ export type EncoderProps = {
 };
 
 export class Encoder {
-	broadcast: Moq.BroadcastProducer;
+	static readonly TRACK = "audio/data";
 	enabled: Signal<boolean>;
 
 	muted: Signal<boolean>;
@@ -54,23 +54,20 @@ export class Encoder {
 	#gain = new Signal<GainNode | undefined>(undefined);
 	readonly root: Getter<AudioNode | undefined> = this.#gain;
 
-	#track = new Moq.TrackProducer("audio", 1);
-
 	#signals = new Effect();
 
-	constructor(broadcast: Moq.BroadcastProducer, props?: EncoderProps) {
-		this.broadcast = broadcast;
+	constructor(props?: EncoderProps) {
 		this.source = Signal.from(props?.source);
 		this.enabled = Signal.from(props?.enabled ?? false);
-		this.speaking = new Speaking(this.broadcast, this.source, props?.speaking);
+		this.speaking = new Speaking(this.source, props?.speaking);
 		this.captions = new Captions(this.speaking, props?.captions);
 		this.muted = Signal.from(props?.muted ?? false);
 		this.volume = Signal.from(props?.volume ?? 1);
 		this.maxLatency = props?.maxLatency ?? (100 as Time.Milli); // Default is a group every 100ms
 
 		this.#signals.effect(this.#runSource.bind(this));
+		this.#signals.effect(this.#runConfig.bind(this));
 		this.#signals.effect(this.#runGain.bind(this));
-		this.#signals.effect(this.#runEncoder.bind(this));
 		this.#signals.effect(this.#runCatalog.bind(this));
 	}
 
@@ -102,7 +99,12 @@ export class Encoder {
 
 		// Async because we need to wait for the worklet to be registered.
 		effect.spawn(async () => {
-			await context.audioWorklet.addModule(CaptureWorklet);
+			const ready = await Promise.race([
+				context.audioWorklet.addModule(CaptureWorklet).then(() => true),
+				effect.cancel,
+			]);
+			if (!ready) return;
+
 			const worklet = new AudioWorkletNode(context, "capture", {
 				numberOfInputs: 1,
 				numberOfOutputs: 0,
@@ -117,6 +119,23 @@ export class Encoder {
 			// Only set the gain after the worklet is registered.
 			effect.set(this.#gain, gain);
 		});
+	}
+
+	#runConfig(effect: Effect): void {
+		const source = effect.get(this.source);
+		if (!source) return;
+
+		const worklet = effect.get(this.#worklet);
+		if (!worklet) return;
+
+		const config = {
+			codec: "opus",
+			sampleRate: u53(worklet.context.sampleRate),
+			numberOfChannels: u53(worklet.channelCount),
+			bitrate: u53(worklet.channelCount * 32_000),
+		};
+
+		effect.set(this.#config, config);
 	}
 
 	#runGain(effect: Effect): void {
@@ -134,7 +153,7 @@ export class Encoder {
 		}
 	}
 
-	#runEncoder(effect: Effect): void {
+	serve(track: Moq.Track, effect: Effect): void {
 		if (!effect.get(this.enabled)) return;
 
 		const source = effect.get(this.source);
@@ -143,25 +162,17 @@ export class Encoder {
 		const worklet = effect.get(this.#worklet);
 		if (!worklet) return;
 
-		const config = {
-			// TODO get codec and description from decoderConfig
-			codec: "opus",
-			sampleRate: u53(worklet.context.sampleRate),
-			numberOfChannels: u53(worklet.channelCount),
-			// TODO configurable
-			bitrate: u53(worklet.channelCount * 32_000),
-			// TODO there's a bunch of advanced Opus settings that we should use.
-		};
+		const config = effect.get(this.#config);
+		if (!config) return;
 
-		let group: Moq.GroupProducer = this.#track.appendGroup();
+		let group: Moq.Group = track.appendGroup();
 		effect.cleanup(() => group.close());
 
-		let groupTimestamp = 0 as Time.Micro;
+		let groupTimestamp: Time.Micro | undefined;
 
-		effect.spawn(async (cancel) => {
+		effect.spawn(async () => {
 			// We're using an async polyfill temporarily for Safari support.
-			const loaded = await Promise.race([libav.polyfill(), cancel]);
-			if (!loaded) return; // cancelled
+			await libav.polyfill();
 
 			const encoder = new AudioEncoder({
 				output: (frame) => {
@@ -169,9 +180,11 @@ export class Encoder {
 						throw new Error("only key frames are supported");
 					}
 
-					if (frame.timestamp - groupTimestamp >= Time.Micro.fromMilli(this.maxLatency)) {
+					if (!groupTimestamp) {
+						groupTimestamp = frame.timestamp as Time.Micro;
+					} else if (frame.timestamp - groupTimestamp >= Time.Micro.fromMilli(this.maxLatency)) {
 						group.close();
-						group = this.#track.appendGroup();
+						group = track.appendGroup();
 						groupTimestamp = frame.timestamp as Time.Micro;
 					}
 
@@ -180,14 +193,14 @@ export class Encoder {
 				},
 				error: (err) => {
 					console.error("encoder error", err);
-					group.abort(err);
+					group.close(err);
 					worklet.port.onmessage = null;
 				},
 			});
 			effect.cleanup(() => encoder.close());
 
+			console.debug("encoding audio", config);
 			encoder.configure(config);
-			effect.set(this.#config, config);
 
 			worklet.port.onmessage = ({ data }: { data: Capture.AudioFrame }) => {
 				const channels = data.channels.slice(0, worklet.channelCount);
@@ -222,18 +235,11 @@ export class Encoder {
 		const config = effect.get(this.#config);
 		if (!config) return;
 
-		// Insert the track into the broadcast before returning the catalog referencing it.
-		this.broadcast.insertTrack(this.#track.consume());
-		effect.cleanup(() => this.broadcast.removeTrack(this.#track.name));
-
 		const captions = effect.get(this.captions.catalog);
 		const speaking = effect.get(this.speaking.catalog);
 
 		const catalog: Catalog.Audio = {
-			track: {
-				name: this.#track.name,
-				priority: u8(this.#track.priority),
-			},
+			track: Encoder.TRACK,
 			config,
 			captions,
 			speaking,
@@ -246,6 +252,5 @@ export class Encoder {
 		this.#signals.close();
 		this.captions.close();
 		this.speaking.close();
-		this.#track.close();
 	}
 }

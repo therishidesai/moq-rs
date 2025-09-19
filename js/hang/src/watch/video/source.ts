@@ -1,8 +1,9 @@
-import type * as Moq from "@kixelated/moq";
+import * as Moq from "@kixelated/moq";
 import { Effect, type Getter, Signal } from "@kixelated/signals";
-import type * as Catalog from "../../catalog";
+import * as Catalog from "../../catalog";
 import * as Frame from "../../frame";
 import * as Hex from "../../util/hex";
+import { PRIORITY } from "../priority";
 import { Detection, type DetectionProps } from "./detection";
 
 export type SourceProps = {
@@ -12,11 +13,10 @@ export type SourceProps = {
 
 // Responsible for switching between video tracks and buffering frames.
 export class Source {
-	broadcast: Signal<Moq.BroadcastConsumer | undefined>;
+	broadcast: Signal<Moq.Broadcast | undefined>;
 	enabled: Signal<boolean>; // Don't download any longer
 	catalog: Signal<Catalog.Root | undefined>;
 	info = new Signal<Catalog.Video | undefined>(undefined);
-	active = new Signal<boolean>(false);
 
 	// Helper that is populated from the catalog.
 	#flip = new Signal<boolean | undefined>(undefined);
@@ -34,7 +34,7 @@ export class Source {
 	#signals = new Effect();
 
 	constructor(
-		broadcast: Signal<Moq.BroadcastConsumer | undefined>,
+		broadcast: Signal<Moq.Broadcast | undefined>,
 		catalog: Signal<Catalog.Root | undefined>,
 		props?: SourceProps,
 	) {
@@ -48,7 +48,6 @@ export class Source {
 			// NOTE: Not gated based on enabled
 			const info = effect.get(this.catalog)?.video?.[0];
 			effect.set(this.info, info);
-			effect.set(this.active, info !== undefined, false);
 			effect.set(this.#flip, info?.config.flip, undefined);
 		});
 
@@ -66,7 +65,7 @@ export class Source {
 		if (!broadcast) return;
 
 		// We don't clear previous frames so we can seamlessly switch tracks.
-		const sub = broadcast.subscribe(info.track.name, info.track.priority);
+		const sub = broadcast.subscribe(info.track, PRIORITY.video);
 		effect.cleanup(() => sub.close());
 
 		const decoder = new VideoDecoder({
@@ -81,7 +80,7 @@ export class Source {
 					return;
 				}
 
-				this.frame.set((prev) => {
+				this.frame.update((prev) => {
 					prev?.close();
 					return this.#next;
 				});
@@ -105,30 +104,36 @@ export class Source {
 			optimizeForLatency: config.optimizeForLatency ?? true,
 		});
 
-		effect.spawn(async (cancel) => {
-			try {
-				for (;;) {
-					const next = await Promise.race([sub.nextFrame(), cancel]);
-					if (!next) break;
+		effect.spawn(async () => {
+			for (;;) {
+				const next = await sub.readFrameSequence();
+				if (!next) break;
 
-					const decoded = Frame.decode(next.data);
+				const decoded = Frame.decode(next.data);
 
-					const chunk = new EncodedVideoChunk({
-						type: next.frame === 0 ? "key" : "delta",
-						data: decoded.data,
-						timestamp: decoded.timestamp,
-					});
+				const chunk = new EncodedVideoChunk({
+					type: next.frame === 0 ? "key" : "delta",
+					data: decoded.data,
+					timestamp: decoded.timestamp,
+				});
 
-					decoder.decode(chunk);
-				}
-			} catch (error) {
-				console.warn("video subscription error", error);
+				decoder.decode(chunk);
 			}
+		});
+
+		effect.cleanup(() => {
+			this.frame.update((frame) => {
+				frame?.close();
+				return undefined;
+			});
+
+			this.#next?.close();
+			this.#next = undefined;
 		});
 	}
 
 	close() {
-		this.frame.set((prev) => {
+		this.frame.update((prev) => {
 			prev?.close();
 			return undefined;
 		});

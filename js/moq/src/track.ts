@@ -1,44 +1,44 @@
-import { type GroupConsumer, GroupProducer } from "./group.ts";
-import { type WatchConsumer, WatchProducer } from "./util/watch.ts";
+import { Signal } from "@kixelated/signals";
+import { Group } from "./group.ts";
 
-/**
- * Handles writing and managing groups in a track.
- *
- * @public
- */
-export class TrackProducer {
-	/** The name of the track */
+export class TrackState {
+	groups = new Signal<Group[]>([]);
+	closed = new Signal<boolean | Error>(false);
+}
+
+export class Track {
 	readonly name: string;
-	/** The priority level of the track */
-	readonly priority: number;
 
-	#latest = new WatchProducer<GroupConsumer | null>(null);
+	state = new TrackState();
 	#next?: number;
 
-	/**
-	 * Creates a new TrackProducer with the specified name, priority, and latest group producer.
-	 * @param name - The name of the track
-	 * @param priority - The priority level
-	 * @param latest - The latest group producer
-	 *
-	 * @internal
-	 */
-	constructor(name: string, priority?: number) {
+	readonly closed: Promise<Error | undefined>;
+
+	constructor(name: string) {
 		this.name = name;
-		this.priority = priority ?? 0;
+
+		this.closed = new Promise((resolve) => {
+			const dispose = this.state.closed.subscribe((closed) => {
+				if (!closed) return;
+				resolve(closed instanceof Error ? closed : undefined);
+				dispose();
+			});
+		});
 	}
 
 	/**
 	 * Appends a new group to the track.
 	 * @returns A GroupProducer for the new group
 	 */
-	appendGroup(): GroupProducer {
-		const group = new GroupProducer(this.#next ?? 0);
+	appendGroup(): Group {
+		if (this.state.closed.peek()) throw new Error("track is closed");
 
-		this.#next = group.id + 1;
-		this.#latest.update((latest) => {
-			latest?.close();
-			return group.consume();
+		const group = new Group(this.#next ?? 0);
+
+		this.#next = group.sequence + 1;
+		this.state.groups.mutate((groups) => {
+			groups.push(group);
+			groups.sort((a, b) => a.sequence - b.sequence);
 		});
 
 		return group;
@@ -48,16 +48,18 @@ export class TrackProducer {
 	 * Inserts an existing group into the track.
 	 * @param group - The group to insert
 	 */
-	insertGroup(group: GroupConsumer) {
+	writeGroup(group: Group) {
+		if (this.state.closed.peek()) throw new Error("track is closed");
+
 		if (group.sequence < (this.#next ?? 0)) {
 			group.close();
 			return;
 		}
 
 		this.#next = group.sequence + 1;
-		this.#latest.update((latest) => {
-			latest?.close();
-			return group;
+		this.state.groups.mutate((groups) => {
+			groups.push(group);
+			groups.sort((a, b) => a.sequence - b.sequence);
 		});
 	}
 
@@ -90,151 +92,70 @@ export class TrackProducer {
 		group.close();
 	}
 
-	/**
-	 * Closes the publisher and all associated groups.
-	 */
-	close() {
-		try {
-			this.#latest.update((latest) => {
-				latest?.close();
-				return null;
-			});
-
-			this.#latest.close();
-		} catch {
-			// Already closed.
-		}
-	}
-
-	closed(): Promise<void> {
-		return this.#latest.closed();
-	}
-
-	/**
-	 * Returns a promise that resolves when the publisher is unused.
-	 * @returns A promise that resolves when unused
-	 */
-	async unused(): Promise<void> {
-		await this.#latest.unused();
-	}
-
-	consume(): TrackConsumer {
-		return new TrackConsumer(this.name, this.priority, this.#latest.consume());
-	}
-
-	/**
-	 * Aborts the publisher with an error.
-	 * @param reason - The error reason for aborting
-	 */
-	abort(reason: Error) {
-		this.#latest.update((latest) => {
-			latest?.close();
-			return null;
-		});
-		this.#latest.abort(reason);
-	}
-}
-
-/**
- * Handles reading groups from a track.
- *
- * @public
- */
-export class TrackConsumer {
-	/** The name of the track */
-	readonly name: string;
-	/** The priority level of the track */
-	readonly priority: number;
-
-	#groups: WatchConsumer<GroupConsumer | null>;
-
-	// State used for the nextFrame helper.
-	#currentGroup?: GroupConsumer;
-	#currentFrame = 0;
-
-	#nextGroup?: Promise<GroupConsumer | undefined>;
-	#nextFrame?: Promise<Uint8Array | undefined>;
-
-	/**
-	 * Creates a new TrackConsumer with the specified name, priority, and groups consumer.
-	 * @param name - The name of the track
-	 * @param priority - The priority level
-	 * @param groups - The groups consumer
-	 *
-	 * @internal
-	 */
-	constructor(name: string, priority: number, groups: WatchConsumer<GroupConsumer | null>) {
-		this.name = name;
-		this.priority = priority;
-		this.#groups = groups;
-
-		// Start fetching the next group immediately.
-		this.#nextGroup = this.#groups.next((group) => !!group).then((group) => group?.clone());
-	}
-
-	/**
-	 * Gets the next group from the track.
-	 * @returns A promise that resolves to the next group or undefined
-	 */
-	async nextGroup(): Promise<GroupConsumer | undefined> {
-		const group = await this.#nextGroup;
-
-		// Start fetching the next group immediately.
-		this.#nextGroup = this.#groups.next((group) => !!group).then((group) => group?.clone());
-
-		// Update the state needed for the nextFrame() helper.
-		this.#currentGroup?.close();
-		this.#currentGroup = group?.clone(); // clone so we don't steal from the returned consumer
-		this.#currentFrame = 0;
-		this.#nextFrame = this.#currentGroup?.readFrame();
-
-		return group;
-	}
-
-	/**
-	 * A helper that returns the next frame in group order, skipping old groups/frames if needed.
-	 *
-	 * Returns the data and the index of the frame/group.
-	 */
-	async nextFrame(): Promise<{ group: number; frame: number; data: Uint8Array } | undefined> {
+	async nextGroup(): Promise<Group | undefined> {
 		for (;;) {
-			const next = await this.#next();
-			if (!next) return undefined;
-
-			if ("frame" in next) {
-				if (!this.#currentGroup) {
-					throw new Error("impossible");
-				}
-
-				// Start reading the next frame.
-				this.#nextFrame = this.#currentGroup?.readFrame();
-
-				// Return the frame and increment the frame index.
-				return { group: this.#currentGroup?.sequence, frame: this.#currentFrame++, data: next.frame };
+			const groups = this.state.groups.peek();
+			if (groups.length > 0) {
+				return groups.shift();
 			}
 
-			this.#nextGroup = this.#groups.next((group) => !!group).then((group) => group?.clone());
+			const closed = this.state.closed.peek();
+			if (closed instanceof Error) throw closed;
+			if (closed) return undefined;
 
-			if (this.#currentGroup && this.#currentGroup.sequence >= next.group.sequence) {
-				// Skip this old group.
-				next.group.close();
-				continue;
-			}
-
-			// Skip the rest of the current group.
-			this.#currentGroup?.close();
-			this.#currentGroup = next.group;
-			this.#currentFrame = 0;
-
-			// Start reading the next frame.
-			this.#nextFrame = this.#currentGroup?.readFrame();
+			await Signal.race(this.state.groups, this.state.closed);
 		}
 	}
 
 	async readFrame(): Promise<Uint8Array | undefined> {
-		const next = await this.nextFrame();
-		if (!next) return undefined;
-		return next.data;
+		return (await this.readFrameSequence())?.data;
+	}
+
+	// Returns the sequence number of the group and frame, not just the data.
+	async readFrameSequence(): Promise<{ group: number; frame: number; data: Uint8Array } | undefined> {
+		for (;;) {
+			const groups = this.state.groups.peek();
+
+			// Discard old groups.
+			while (groups.length > 1) {
+				const frames = groups[0].state.frames.peek();
+				const next = frames.shift();
+				if (next) {
+					const frame = groups[0].state.total.peek() - frames.length - 1;
+					return { group: groups[0].sequence, frame, data: next };
+				}
+
+				// Skip this old group
+				groups.shift()?.close();
+			}
+
+			// If there's no groups, wait for a new one.
+			if (groups.length === 0) {
+				const closed = this.state.closed.peek();
+				if (closed instanceof Error) throw closed;
+				if (closed) return undefined;
+
+				await Signal.race(this.state.groups, this.state.closed);
+				continue;
+			}
+
+			// If there's a group, wait for a frame.
+			const group = groups[0];
+			const frames = group.state.frames.peek();
+			const next = frames.shift();
+			if (next) {
+				const frame = group.state.total.peek() - frames.length - 1;
+				return { group: group.sequence, frame, data: next };
+			}
+
+			// If the track is closed, return undefined.
+			const closed = this.state.closed.peek();
+			if (closed instanceof Error) throw closed;
+			if (closed) return undefined;
+
+			// NOTE: We don't care if the latest group was closed or not.
+			await Signal.race(this.state.groups, this.state.closed, group.state.frames);
+		}
 	}
 
 	async readString(): Promise<string | undefined> {
@@ -256,67 +177,14 @@ export class TrackConsumer {
 		return next[0] === 1;
 	}
 
-	// Returns the next non-undefined value from the nextFrame or nextGroup promises.
-	async #next(): Promise<{ frame: Uint8Array } | { group: GroupConsumer } | undefined> {
-		const nextFrame = this.#nextFrame
-			?.then((frame) => ({ frame }))
-			// Ignore errors reading the group; we can move on to the next group instead.
-			.catch((error) => {
-				console.warn("ignoring error reading frame", error);
-				return { frame: undefined };
-			}) ?? { frame: undefined };
+	/**
+	 * Closes the publisher and all associated groups.
+	 */
+	close(abort?: Error) {
+		this.state.closed.set(abort ?? true);
 
-		const nextGroup = this.#nextGroup?.then((group) => ({ group })) ?? { group: undefined };
-
-		// The order matters here, because Promise.race returns the first resolved value *in order*.
-		// This is also why we're not using Promise.any, because I think it works differently?
-		const result = await Promise.race([nextFrame, nextGroup]);
-		if ("frame" in result) {
-			if (result.frame) {
-				return { frame: result.frame };
-			}
-
-			const other = await nextGroup;
-			return other.group ? { group: other.group } : undefined;
+		for (const group of this.state.groups.peek()) {
+			group.close(abort);
 		}
-
-		if (result.group) {
-			return { group: result.group };
-		}
-
-		const other = await nextFrame;
-		return other.frame ? { frame: other.frame } : undefined;
-	}
-
-	/**
-	 * Creates a new instance of the consumer using the same groups consumer.
-	 *
-	 * The current group and position within the group is not preserved.
-	 *
-	 * @returns A new TrackConsumer instance
-	 */
-	clone(): TrackConsumer {
-		return new TrackConsumer(this.name, this.priority, this.#groups.clone());
-	}
-
-	/**
-	 * Closes the consumer.
-	 */
-	close() {
-		this.#groups.close();
-
-		this.#nextGroup?.then((group) => group?.close()).catch(() => {});
-		this.#nextGroup = undefined;
-		this.#nextFrame = undefined;
-		this.#currentGroup?.close();
-		this.#currentGroup = undefined;
-	}
-
-	/**
-	 * Returns a promise that resolves when the consumer is closed.
-	 * @returns A promise that resolves when closed
-	 */
-	async closed(): Promise<void> {
-		await this.#groups.closed();
 	}
 }

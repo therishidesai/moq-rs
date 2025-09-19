@@ -3,7 +3,7 @@
 // @ts-ignore Deno import.
 import { parseArgs } from "jsr:@std/cli/parse-args";
 
-import { BroadcastProducer, connect, Path } from "@kixelated/moq";
+import * as Moq from "@kixelated/moq";
 
 interface Config {
 	url: string;
@@ -69,29 +69,37 @@ ENVIRONMENT VARIABLES:
 }
 
 async function publish(config: Config) {
-	const connection = await connect(new URL(config.url));
+	const connection = await Moq.Connection.connect(new URL(config.url));
 	console.log("✅ Connected to relay:", config.url);
 
 	// Create a new "broadcast", which is a collection of tracks.
-	const broadcastProducer = new BroadcastProducer();
-	connection.publish(Path.from(config.broadcast), broadcastProducer.consume());
+	const broadcast = new Moq.Broadcast();
+	connection.publish(Moq.Path.from(config.broadcast), broadcast);
 
 	console.log("✅ Published broadcast:", config.broadcast);
 
-	// Within our broadcast, create a single track.
-	const trackProducer = broadcastProducer.createTrack(config.track);
+	// Wait until we get a subscription for the track
+	for (;;) {
+		const request = await broadcast.requested();
+		if (!request) break;
 
+		if (request.track.name === config.track) {
+			publishTrack(request.track);
+		} else {
+			request.track.close(new Error("not found"));
+		}
+	}
+}
+
+async function publishTrack(track: Moq.Track) {
 	// Send timestamps over the wire, matching the Rust implementation format
-	console.log("✅ Publishing clock data on track:", config.track);
-
-	// NOTE: No data flows over the network until there's an active subscription
-	// You can think of trackProducer as a cache, storing data until needed.
+	console.log("✅ Publishing clock data on track:", track.name);
 
 	for (;;) {
 		const now = new Date();
 
 		// Create a new group for each minute (matching Rust implementation)
-		const group = trackProducer.appendGroup();
+		const group = track.appendGroup();
 
 		// Send the base timestamp (everything but seconds) - matching Rust format
 		const base = `${now.toISOString().slice(0, 16).replace("T", " ")}:`;
@@ -126,28 +134,10 @@ async function publish(config: Config) {
 }
 
 async function subscribe(config: Config) {
-	const connection = await connect(new URL(config.url));
+	const connection = await Moq.Connection.connect(new URL(config.url));
 	console.log("✅ Connected to relay:", config.url);
 
-	// Optionally wait for the broadcast to be announced.
-	// You can use a shorter prefix if you care about multiple broadcasts.
-	const prefix = Path.from(config.broadcast);
-	const announced = connection.announced(prefix);
-
-	console.log("🔍 Waiting for announce:", prefix);
-
-	// Start a 1 second timeout because announcements are technically not required.
-	// But you're pretty screwed if you don't get one.
-	const timeout = new Promise((resolve) => setTimeout(resolve, 1000));
-
-	const announce = await Promise.race([announced.next(), timeout]);
-	if (!announce) {
-		console.warn("⚠️ No announce found after 1 second, subscribing anyway...");
-	} else {
-		console.log("🎉 Announced:", announce);
-	}
-
-	const broadcast = connection.consume(Path.from(config.broadcast));
+	const broadcast = connection.consume(Moq.Path.from(config.broadcast));
 	const track = broadcast.subscribe(config.track, 0);
 
 	console.log("✅ Subscribed to track:", config.track);

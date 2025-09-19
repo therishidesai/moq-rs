@@ -1,48 +1,42 @@
 import * as Moq from "@kixelated/moq";
 import { Effect, Signal } from "@kixelated/signals";
-import type { Info } from "../preview";
+import * as Catalog from "../catalog";
 
 export type PreviewProps = {
 	enabled?: boolean | Signal<boolean>;
-	info?: Info | Signal<Info | undefined>;
+	info?: Catalog.Preview | Signal<Catalog.Preview | undefined>;
 };
 
 export class Preview {
-	broadcast: Moq.BroadcastProducer;
+	static readonly TRACK = "preview.json";
+
 	enabled: Signal<boolean>;
-	info: Signal<Info | undefined>;
+	info: Signal<Catalog.Preview | undefined>;
 
-	#track = new Moq.TrackProducer("preview.json", 0);
-	#signals = new Effect();
+	catalog = new Signal<Catalog.Track | undefined>(undefined);
 
-	constructor(broadcast: Moq.BroadcastProducer, props?: PreviewProps) {
-		this.broadcast = broadcast;
+	signals = new Effect();
+
+	constructor(props?: PreviewProps) {
 		this.enabled = Signal.from(props?.enabled ?? false);
 		this.info = Signal.from(props?.info);
 
-		this.#signals.effect((effect) => {
-			const enabled = effect.get(this.enabled);
-			if (!enabled) return;
-
-			broadcast.insertTrack(this.#track.consume());
-			effect.cleanup(() => broadcast.removeTrack(this.#track.name));
-		});
-
-		this.#signals.effect((effect) => {
+		this.signals.effect((effect) => {
 			if (!effect.get(this.enabled)) return;
-
-			const info = effect.get(this.info);
-			if (!info) return;
-
-			this.#publish(info);
+			effect.set(this.catalog, Preview.TRACK);
 		});
 	}
 
-	#publish(preview: Info) {
-		this.#track.writeJson(preview);
+	serve(track: Moq.Track, effect: Effect): void {
+		if (!effect.get(this.enabled)) return;
+
+		const info = effect.get(this.info);
+		if (!info) return;
+
+		track.writeJson(info);
 	}
 
 	close() {
-		this.#signals.close();
+		this.signals.close();
 	}
 }

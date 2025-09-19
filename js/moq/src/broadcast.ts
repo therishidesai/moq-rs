@@ -1,12 +1,14 @@
-import { type TrackConsumer, TrackProducer } from "./track.ts";
-import { type WatchConsumer, WatchProducer } from "./util/watch.ts";
+import { Signal } from "@kixelated/signals";
+import { Track } from "./track.ts";
 
-class State {
-	tracks = new Map<string, TrackConsumer>();
+export interface TrackRequest {
+	track: Track;
+	priority: number;
+}
 
-	// Called when a track is not found.
-	// The receiver is responsible for producing the track.
-	onUnknown?: (track: TrackProducer) => void;
+export class BroadcastState {
+	requested = new Signal<TrackRequest[]>([]);
+	closed = new Signal<boolean | Error>(false);
 }
 
 /**
@@ -14,167 +16,68 @@ class State {
  *
  * @public
  */
-export class BroadcastProducer {
-	#state: WatchProducer<State>;
+export class Broadcast {
+	state = new BroadcastState();
 
-	/**
-	 * @internal
-	 */
+	readonly closed: Promise<Error | undefined>;
+
 	constructor() {
-		this.#state = new WatchProducer<State>(new State());
+		this.closed = new Promise((resolve) => {
+			const dispose = this.state.closed.subscribe((closed) => {
+				if (!closed) return;
+				resolve(closed instanceof Error ? closed : undefined);
+				dispose();
+			});
+		});
 	}
 
 	/**
-	 * Creates a new track with the specified name.
-	 * @param name - The name of the track to create
-	 * @returns A TrackProducer for the new track
+	 * A track requested over the network.
 	 */
-	createTrack(name: string): TrackProducer {
-		const track = new TrackProducer(name, 0);
-		this.insertTrack(track.consume());
+	async requested(): Promise<TrackRequest | undefined> {
+		for (;;) {
+			// We use pop instead of shift because it's slightly more efficient.
+			const track = this.state.requested.peek().pop();
+			if (track) return track;
+
+			const closed = this.state.closed.peek();
+			if (closed instanceof Error) throw closed;
+			if (closed) return undefined;
+
+			await Signal.race(this.state.requested, this.state.closed);
+		}
+	}
+
+	/**
+	 * Populates the provided track over the network.
+	 */
+	subscribe(name: string, priority: number): Track {
+		const track = new Track(name);
+
+		if (this.state.closed.peek()) {
+			throw new Error(`broadcast is closed: ${this.state.closed.peek()}`);
+		}
+		this.state.requested.mutate((requested) => {
+			requested.push({ track, priority });
+			// Sort the tracks by priority in ascending order (we will pop)
+			requested.sort((a, b) => a.priority - b.priority);
+		});
+
 		return track;
 	}
 
 	/**
-	 * Inserts an existing track into the broadcast.
-	 * @param track - The track reader to insert
-	 */
-	insertTrack(track: TrackConsumer) {
-		this.#state.update((state) => {
-			const existing = state.tracks.get(track.name);
-			existing?.close();
-			state.tracks.set(track.name, track);
-			return state;
-		});
-	}
-
-	/**
-	 * Removes a track from the broadcast.
-	 * @param name - The name of the track to remove
-	 */
-	removeTrack(name: string) {
-		try {
-			this.#state.update((state) => {
-				const track = state.tracks.get(name);
-				track?.close();
-				state.tracks.delete(name);
-				return state;
-			});
-		} catch {
-			// We don't care if we try to remove when closed
-		}
-	}
-
-	/**
-	 * Sets a callback for handling unknown (on-demand) tracks.
-	 * If not specified, unknown tracks will be closed with a "not found" error.
-	 *
-	 * @param fn - The callback function to handle unknown tracks
-	 */
-	unknownTrack(fn?: (track: TrackProducer) => void) {
-		this.#state.update((state) => {
-			state.onUnknown = fn;
-			return state;
-		});
-	}
-
-	/**
-	 * Aborts the writer with an error.
-	 * @param reason - The error reason for aborting
-	 */
-	abort(reason: Error) {
-		this.#state.abort(reason);
-	}
-
-	/**
 	 * Closes the writer and all associated tracks.
+	 *
+	 * @param abort - If provided, throw this exception instead of returning undefined.
 	 */
-	close() {
-		this.#state.update((state) => {
-			for (const track of state.tracks.values()) {
-				track.close();
-			}
-			state.tracks.clear();
-			return state;
+	close(abort?: Error) {
+		this.state.closed.set(abort ?? true);
+		for (const { track } of this.state.requested.peek()) {
+			track.close(abort);
+		}
+		this.state.requested.mutate((requested) => {
+			requested.length = 0;
 		});
-		this.#state.close();
-	}
-
-	/**
-	 * Returns a promise that resolves when the writer is unused.
-	 */
-	async unused(): Promise<void> {
-		return this.#state.unused();
-	}
-
-	consume(): BroadcastConsumer {
-		return new BroadcastConsumer(this.#state.consume());
-	}
-}
-
-/**
- * Handles reading and subscribing to tracks in a broadcast.
- *
- * @remarks `clone()` can be used to create multiple consumers, just remember to `close()` them.
- *
- * @public
- */
-export class BroadcastConsumer {
-	#state: WatchConsumer<State>;
-
-	/**
-	 * @internal
-	 */
-	constructor(state: WatchConsumer<State>) {
-		this.#state = state;
-	}
-
-	/**
-	 * Subscribes to a track with the specified priority.
-	 * @param track - The name of the track to subscribe to
-	 * @param priority - The priority level for the subscription
-	 * @returns A TrackConsumer for the subscribed track
-	 */
-	subscribe(track: string, priority: number): TrackConsumer {
-		const state = this.#state.value();
-
-		const existing = state.tracks.get(track);
-		if (existing) {
-			return existing.clone();
-		}
-
-		const producer = new TrackProducer(track, priority);
-		const consumer = producer.consume();
-
-		if (state.onUnknown) {
-			state.onUnknown(producer);
-		} else {
-			producer.abort(new Error("not found"));
-		}
-
-		return consumer;
-	}
-
-	/**
-	 * Returns a promise that resolves when the reader is closed.
-	 * @returns A promise that resolves when closed
-	 */
-	async closed(): Promise<void> {
-		return this.#state.closed();
-	}
-
-	/**
-	 * Closes the reader.
-	 */
-	close() {
-		this.#state.close();
-	}
-
-	/**
-	 * Creates a new instance of the reader using the same state.
-	 * @returns A new BroadcastConsumer instance
-	 */
-	clone(): BroadcastConsumer {
-		return new BroadcastConsumer(this.#state.clone());
 	}
 }

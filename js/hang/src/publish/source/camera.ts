@@ -1,20 +1,20 @@
 import { Effect, Signal } from "@kixelated/signals";
-import type { VideoConstraints, VideoStreamTrack } from "../video";
+import * as Video from "../video";
 import { Device, type DeviceProps } from "./device";
 
 export interface CameraProps {
 	enabled?: boolean | Signal<boolean>;
 	device?: DeviceProps;
-	constraints?: VideoConstraints | Signal<VideoConstraints | undefined>;
+	constraints?: Video.Constraints | Signal<Video.Constraints | undefined>;
 }
 
 export class Camera {
 	enabled: Signal<boolean>;
 	device: Device<"video">;
 
-	constraints: Signal<VideoConstraints | undefined>;
+	constraints: Signal<Video.Constraints | undefined>;
 
-	stream = new Signal<VideoStreamTrack | undefined>(undefined);
+	source = new Signal<Video.Source | undefined>(undefined);
 	signals = new Effect();
 
 	constructor(props?: CameraProps) {
@@ -55,13 +55,13 @@ export class Camera {
 
 			this.device.permission.set(true);
 
-			const track = stream.getVideoTracks()[0] as VideoStreamTrack | undefined;
-			if (!track) return;
+			const source = stream.getVideoTracks()[0] as Video.Source | undefined;
+			if (!source) return;
 
-			const settings = track.getSettings();
+			const settings = source.getSettings();
 
 			effect.set(this.device.active, settings.deviceId);
-			effect.set(this.stream, track, undefined);
+			effect.set(this.source, source);
 		});
 	}
 

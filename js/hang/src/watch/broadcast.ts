@@ -8,7 +8,6 @@ import { Preview, type PreviewProps } from "./preview";
 import { PRIORITY } from "./priority";
 import * as User from "./user";
 import * as Video from "./video";
-import { Detection, type DetectionProps } from "./video/detection";
 
 export interface BroadcastProps {
 	connection?: Moq.Connection.Established | Signal<Moq.Connection.Established | undefined>;
@@ -27,7 +26,6 @@ export interface BroadcastProps {
 	audio?: Audio.SourceProps;
 	location?: Location.Props;
 	chat?: ChatProps;
-	detection?: DetectionProps;
 	preview?: PreviewProps;
 	user?: User.Props;
 }
@@ -45,7 +43,6 @@ export class Broadcast {
 	video: Video.Source;
 	location: Location.Root;
 	chat: Chat;
-	detection: Detection;
 	preview: Preview;
 	user: User.Info;
 
@@ -69,7 +66,6 @@ export class Broadcast {
 		this.video = new Video.Source(this.#broadcast, this.#catalog, props?.video);
 		this.location = new Location.Root(this.#broadcast, this.#catalog, props?.location);
 		this.chat = new Chat(this.#broadcast, this.#catalog, props?.chat);
-		this.detection = new Detection(this.#broadcast, this.#catalog, props?.detection);
 		this.preview = new Preview(this.#broadcast, this.#catalog, props?.preview);
 		this.user = new User.Info(this.#catalog, props?.user);
 
@@ -167,7 +163,6 @@ export class Broadcast {
 		this.video.close();
 		this.location.close();
 		this.chat.close();
-		this.detection.close();
 		this.preview.close();
 		this.user.close();
 	}

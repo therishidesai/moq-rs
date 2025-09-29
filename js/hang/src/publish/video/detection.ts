@@ -13,10 +13,10 @@ export type DetectionProps = {
 };
 
 export class Detection {
-	static readonly TRACK = "video/detection.json";
-	frame: () => VideoFrame | undefined;
+	static readonly TRACK: Catalog.Track = "video/detection.json";
 
 	enabled: Signal<boolean>;
+	frame: Getter<VideoFrame | undefined>;
 	objects = new Signal<Catalog.DetectionObjects | undefined>(undefined);
 
 	#interval: number;
@@ -27,7 +27,7 @@ export class Detection {
 
 	signals = new Effect();
 
-	constructor(frame: () => VideoFrame | undefined, props?: DetectionProps) {
+	constructor(frame: Getter<VideoFrame | undefined>, props?: DetectionProps) {
 		this.frame = frame;
 		this.enabled = Signal.from(props?.enabled ?? false);
 		this.#interval = props?.interval ?? 1000;
@@ -54,29 +54,21 @@ export class Detection {
 
 		const api = Comlink.wrap<DetectionWorker>(worker);
 
-		let timeout: ReturnType<typeof setTimeout>;
-		effect.cleanup(() => clearTimeout(timeout));
-
 		effect.spawn(async () => {
 			const ready = await api.ready();
 			if (!ready) return;
-			process();
+
+			effect.interval(async () => {
+				const frame = this.frame.peek();
+				if (!frame) return;
+
+				const cloned = frame.clone();
+				const result = await api.detect(Comlink.transfer(cloned, [cloned]), this.#threshold);
+
+				this.objects.set(result);
+				track.writeJson(result);
+			}, this.#interval);
 		});
-
-		const process = async () => {
-			const frame = this.frame();
-			if (!frame) return;
-
-			const cloned = frame.clone();
-			const result = await api.detect(Comlink.transfer(cloned, [cloned]), this.#threshold);
-
-			this.objects.set(result);
-			track.writeJson(result);
-
-			// Schedule the next detection only after this one is complete.
-			// Otherwise, we're in trouble if it takes >= interval to complete.
-			timeout = setTimeout(process, this.#interval);
-		};
 
 		effect.cleanup(() => this.objects.set(undefined));
 	}

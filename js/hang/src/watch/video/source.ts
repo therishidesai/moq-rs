@@ -14,19 +14,36 @@ export type SourceProps = {
 	latency?: Time.Milli | Signal<Time.Milli>;
 };
 
+export type Target = {
+	// The desired size of the video in pixels.
+	pixels?: number;
+
+	// TODO bitrate
+};
+
 // Responsible for switching between video tracks and buffering frames.
 export class Source {
 	broadcast: Signal<Moq.Broadcast | undefined>;
 	enabled: Signal<boolean>; // Don't download any longer
-	catalog: Signal<Catalog.Root | undefined>;
-	info = new Signal<Catalog.Video | undefined>(undefined);
 
-	// Helper that is populated from the catalog.
-	#flip = new Signal<boolean | undefined>(undefined);
-	readonly flip: Getter<boolean | undefined> = this.#flip;
+	catalog = new Signal<Catalog.Video[] | undefined>(undefined);
+
+	// The tracks supported by our video decoder.
+	supported = new Signal<Catalog.Video[]>([]);
+
+	// The track we chose from the supported tracks.
+	#selected = new Signal<Catalog.Video | undefined>(undefined);
+	readonly selected: Getter<Catalog.Video | undefined> = this.#selected;
 
 	detection: Detection;
 
+	// Used as a tiebreaker when there are multiple tracks (HD vs SD).
+	target = new Signal<Target | undefined>(undefined);
+
+	// Unfortunately, browsers don't let us hold on to multiple VideoFrames.
+	// TODO To support higher latencies, keep around the encoded data and decode on demand.
+	// ex. Firefox only allows 2 outstanding VideoFrames at a time.
+	// We hold a second frame buffered as a crude way to introduce latency to sync with audio.
 	frame = new Signal<VideoFrame | undefined>(undefined);
 
 	latency: Signal<Time.Milli>;
@@ -39,34 +56,85 @@ export class Source {
 		props?: SourceProps,
 	) {
 		this.broadcast = broadcast;
-		this.catalog = catalog;
 		this.latency = Signal.from(props?.latency ?? (100 as Time.Milli));
 		this.enabled = Signal.from(props?.enabled ?? false);
-		this.detection = new Detection(this.broadcast, this.catalog, props?.detection);
+		this.detection = new Detection(this.broadcast, catalog, props?.detection);
 
-		// TODO use isConfigSupported
-		this.#signals.effect((effect) => {
-			// NOTE: Not gated based on enabled
-			const info = effect.get(this.catalog)?.video?.[0];
-			effect.set(this.info, info);
-			effect.set(this.#flip, info?.config.flip, undefined);
-		});
-
+		this.#signals.effect(this.#runSupported.bind(this));
+		this.#signals.effect(this.#runSelected.bind(this));
 		this.#signals.effect(this.#init.bind(this));
+
+		this.#signals.effect((effect) => {
+			this.catalog.set(effect.get(catalog)?.video);
+		});
+	}
+
+	#runSupported(effect: Effect): void {
+		const renditions = effect.get(this.catalog) ?? [];
+
+		effect.spawn(async () => {
+			const supported: Catalog.Video[] = [];
+
+			for (const rendition of renditions) {
+				const description = rendition.config.description
+					? Hex.toBytes(rendition.config.description)
+					: undefined;
+
+				const { supported: valid } = await VideoDecoder.isConfigSupported({
+					...rendition.config,
+					description,
+					optimizeForLatency: rendition.config.optimizeForLatency ?? true,
+				});
+				if (valid) supported.push(rendition);
+			}
+
+			effect.set(this.supported, supported, []);
+		});
+	}
+
+	#runSelected(effect: Effect): void {
+		const supported = effect.get(this.supported);
+		const target = effect.get(this.target);
+		const closest = this.#selectRendition(supported, target);
+
+		this.#selected.set(closest);
+	}
+
+	#selectRendition(renditions: Catalog.Video[], target?: Target): Catalog.Video | undefined {
+		// If we have no target, then choose the largest supported rendition.
+		// This is kind of a hack to use MAX_SAFE_INTEGER / 2 - 1 but IF IT WORKS, IT WORKS.
+		const pixels = target?.pixels ?? Number.MAX_SAFE_INTEGER / 2 - 1;
+
+		let closest: Catalog.Video | undefined;
+		let minDistance = Number.MAX_SAFE_INTEGER;
+
+		for (const rendition of renditions) {
+			if (!rendition.config.codedHeight || !rendition.config.codedWidth) continue;
+
+			const distance = Math.abs(pixels - rendition.config.codedHeight * rendition.config.codedWidth);
+			if (distance < minDistance) {
+				minDistance = distance;
+				closest = rendition;
+			}
+		}
+		if (closest) return closest;
+
+		// If we couldn't find a closest, or there's no width/height, then choose the first supported rendition.
+		return renditions.at(0);
 	}
 
 	#init(effect: Effect): void {
 		const enabled = effect.get(this.enabled);
 		if (!enabled) return;
 
-		const info = effect.get(this.info);
-		if (!info) return;
+		const selected = effect.get(this.#selected);
+		if (!selected) return;
 
 		const broadcast = effect.get(this.broadcast);
 		if (!broadcast) return;
 
 		// We don't clear previous frames so we can seamlessly switch tracks.
-		const sub = broadcast.subscribe(info.track, PRIORITY.video);
+		const sub = broadcast.subscribe(selected.track, PRIORITY.video);
 		effect.cleanup(() => sub.close());
 
 		// Create consumer that reorders groups/frames up to the provided latency.
@@ -90,13 +158,12 @@ export class Source {
 		});
 		effect.cleanup(() => decoder.close());
 
-		const config = info.config;
-		const description = config.description ? Hex.toBytes(config.description) : undefined;
+		const description = selected.config.description ? Hex.toBytes(selected.config.description) : undefined;
 
 		decoder.configure({
-			...config,
+			...selected.config,
 			description,
-			optimizeForLatency: config.optimizeForLatency ?? true,
+			optimizeForLatency: selected.config.optimizeForLatency ?? true,
 		});
 
 		effect.spawn(async () => {

@@ -23,6 +23,11 @@ export type Target = {
 	// TODO bitrate
 };
 
+// The types in VideoDecoderConfig that cause a hard reload.
+// ex. codedWidth/Height are optional and can be changed in-band, so we don't want to trigger a reload.
+// This way we can keep the current subscription active.
+type RequiredDecoderConfig = Omit<Catalog.VideoConfig, "codedWidth" | "codedHeight">;
+
 // Responsible for switching between video tracks and buffering frames.
 export class Source {
 	broadcast: Signal<Moq.Broadcast | undefined>;
@@ -34,7 +39,8 @@ export class Source {
 	#supported = new Signal<Record<string, Catalog.VideoConfig>>({});
 
 	// The track we chose from the supported tracks.
-	#selected = new Signal<[string, Catalog.VideoConfig] | undefined>(undefined);
+	#selected = new Signal<string | undefined>(undefined);
+	#selectedConfig = new Signal<RequiredDecoderConfig | undefined>(undefined);
 
 	// The name of the active rendition.
 	active = new Signal<string | undefined>(undefined);
@@ -129,14 +135,19 @@ export class Source {
 		if (!selected) return;
 
 		effect.set(this.#selected, selected);
+
+		// Remove the codedWidth/Height from the config to avoid a hard reload if nothing else has changed.
+		const config = { ...supported[selected], codedWidth: undefined, codedHeight: undefined };
+		effect.set(this.#selectedConfig, config);
 	}
 
 	#runPending(effect: Effect): void {
 		const broadcast = effect.get(this.broadcast);
-		const selected = effect.get(this.#selected);
 		const enabled = effect.get(this.enabled);
+		const selected = effect.get(this.#selected);
+		const config = effect.get(this.#selectedConfig);
 
-		if (!broadcast || !selected || !enabled) {
+		if (!broadcast || !selected || !config || !enabled) {
 			// Stop the active track.
 			this.#active?.close();
 			this.#active = undefined;
@@ -156,12 +167,13 @@ export class Source {
 		this.#pending = new Effect();
 
 		// NOTE: If the track catches up in time, it'll remove itself from #pending.
+		// We use #pending here on purpose so we only close it when it hasn't caught up yet.
 		effect.cleanup(() => this.#pending?.close());
 
-		this.#runTrack(this.#pending, broadcast, selected[0], selected[1]);
+		this.#runTrack(this.#pending, broadcast, selected, config);
 	}
 
-	#runTrack(effect: Effect, broadcast: Moq.Broadcast, name: string, config: Catalog.VideoConfig): void {
+	#runTrack(effect: Effect, broadcast: Moq.Broadcast, name: string, config: RequiredDecoderConfig): void {
 		const sub = broadcast.subscribe(name, PRIORITY.video); // TODO use priority from catalog
 		effect.cleanup(() => sub.close());
 
@@ -224,11 +236,9 @@ export class Source {
 		});
 		effect.cleanup(() => decoder.close());
 
-		const description = config.description ? Hex.toBytes(config.description) : undefined;
-
 		decoder.configure({
 			...config,
-			description,
+			description: config.description ? Hex.toBytes(config.description) : undefined,
 			optimizeForLatency: config.optimizeForLatency ?? true,
 			// @ts-expect-error Only supported by Chrome, so the renderer has to flip manually.
 			flip: false,
@@ -277,12 +287,9 @@ export class Source {
 		});
 	}
 
-	#selectRendition(
-		renditions: Record<string, Catalog.VideoConfig>,
-		target?: Target,
-	): [string, Catalog.VideoConfig] | undefined {
+	#selectRendition(renditions: Record<string, Catalog.VideoConfig>, target?: Target): string | undefined {
 		const entries = Object.entries(renditions);
-		if (entries.length <= 1) return entries.at(0);
+		if (entries.length <= 1) return entries.at(0)?.[0];
 
 		// If we have no target, then choose the largest supported rendition.
 		// This is kind of a hack to use MAX_SAFE_INTEGER / 2 - 1 but IF IT WORKS, IT WORKS.
@@ -291,10 +298,10 @@ export class Source {
 		// Round up to the closest rendition.
 		// Also keep track of the 2nd closest, just in case there's nothing larger.
 
-		let larger: [string, Catalog.VideoConfig] | undefined;
+		let larger: string | undefined;
 		let largerSize: number | undefined;
 
-		let smaller: [string, Catalog.VideoConfig] | undefined;
+		let smaller: string | undefined;
 		let smallerSize: number | undefined;
 
 		for (const [name, rendition] of entries) {
@@ -302,10 +309,10 @@ export class Source {
 
 			const size = rendition.codedHeight * rendition.codedWidth;
 			if (size > pixels && (!largerSize || size < largerSize)) {
-				larger = [name, rendition];
+				larger = name;
 				largerSize = size;
 			} else if (size < pixels && (!smallerSize || size > smallerSize)) {
-				smaller = [name, rendition];
+				smaller = name;
 				smallerSize = size;
 			}
 		}
@@ -313,7 +320,7 @@ export class Source {
 		if (smaller) return smaller;
 
 		console.warn("no width/height information, choosing the first supported rendition");
-		return entries.at(0);
+		return entries[0][0];
 	}
 
 	#runDisplay(effect: Effect): void {
@@ -339,12 +346,13 @@ export class Source {
 	}
 
 	#runJitter(effect: Effect): void {
-		const selected = effect.get(this.#selected);
-		if (!selected) return;
+		const config = effect.get(this.#selectedConfig);
+		if (!config) return;
 
 		// Use the framerate to compute the jitter buffer size.
 		// We always buffer a single frame, so subtract that from the jitter buffer.
-		const delay = 1000 / (selected[1].framerate ?? 30);
+		const fps = config.framerate && config.framerate > 0 ? config.framerate : 30;
+		const delay = 1000 / fps;
 		const latency = effect.get(this.latency);
 
 		const jitter = Math.max(0, latency - delay) as Time.Milli;

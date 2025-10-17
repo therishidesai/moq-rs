@@ -5,14 +5,14 @@ use crate::{
 	ietf, lite, Error, OriginConsumer, OriginProducer,
 };
 
-pub struct Session<S: web_transport_trait::Session + Sync> {
+pub struct Session<S: web_transport_trait::Session> {
 	session: S,
 }
 
 /// The versions of MoQ that are supported by this implementation.
 const SUPPORTED: [coding::Version; 2] = [coding::Version::LITE_LATEST, coding::Version::IETF_LATEST];
 
-impl<S: web_transport_trait::Session + Sync> Session<S> {
+impl<S: web_transport_trait::Session> Session<S> {
 	fn new(session: S) -> Self {
 		Self { session }
 	}
@@ -124,7 +124,10 @@ impl<S: web_transport_trait::Session + Sync> Session<S> {
 	}
 
 	/// Block until the transport session is closed.
-	pub async fn closed(&self) -> Error {
-		Error::Transport(Arc::new(self.session.closed().await))
+	pub async fn closed(&self) -> Result<(), Error> {
+		match self.session.closed().await {
+			Ok(()) => Ok(()),
+			Err(err) => Err(Error::Transport(Arc::new(err))),
+		}
 	}
 }

@@ -75,7 +75,7 @@ export class Encoder {
 		effect.set(this.active, true, false);
 
 		effect.spawn(async () => {
-			let group: Moq.Group | undefined; // TODO close
+			let group: Moq.Group | undefined;
 			effect.cleanup(() => group?.close());
 
 			let groupTimestamp: Time.Micro | undefined;
@@ -106,7 +106,6 @@ export class Encoder {
 				if (!config) return;
 
 				encoder.configure(config);
-				console.debug("encoding video", config);
 			});
 
 			effect.effect((effect) => {

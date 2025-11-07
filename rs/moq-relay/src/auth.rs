@@ -93,7 +93,8 @@ impl Auth {
 		// Find the token in the query parameters.
 		// ?jwt=...
 		let claims = if let Some(token) = token {
-			if let Some(key) = self.key.as_ref() {
+		    if let Some(key) = self.key.as_ref() {
+                        tracing::info!("Got key: {:?} on {path}", key);
 				key.decode(token).map_err(|_| AuthError::DecodeFailed)?
 			} else {
 				return Err(AuthError::UnexpectedToken);
